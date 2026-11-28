@@ -212,19 +212,30 @@ enum UrlPattern {
 
 impl UrlPattern {
     /// A pattern with `*`, `?` or `[` is a glob with `glob` 0.3 syntax (checked by
-    /// `glob::Pattern::new`); any other pattern is a path prefix of whole segments.
+    /// `glob::Pattern::new`); any other pattern is a path prefix of whole segments. URLs are
+    /// matched percent-encoded, so the pattern's literal characters are encoded the way `url`
+    /// encodes a path. An absolute pattern's scheme and host are lowercased and a default port
+    /// dropped, as `url` normalizes them.
     fn parse(raw: &str) -> Result<Self> {
         let trimmed = raw.trim();
-        let absolute = trimmed.starts_with("http://") || trimmed.starts_with("https://");
-        let text = if absolute {
-            trimmed
-        } else {
-            trimmed.trim_start_matches("./").trim_start_matches('/')
+        let absolute = normalize_absolute_pattern(trimmed);
+        let text = match &absolute {
+            Some(normalized) => normalized.as_str(),
+            None => trimmed.trim_start_matches("./").trim_start_matches('/'),
         };
         if text.is_empty() {
             return Err(VaultError::Validation(
                 "include/exclude pattern must not be empty".into(),
             ));
+        }
+        if let Some((_, after)) = text.split_once('?') {
+            if after.contains(['=', '&']) {
+                return Err(VaultError::Validation(format!(
+                    "pattern '{raw}' looks like it matches a query string; patterns match only \
+                     the URL path (any query string may follow a match), and '?' stands for one \
+                     path character"
+                )));
+            }
         }
         let body = if text.contains(['*', '?', '[']) {
             glob::Pattern::new(text).map_err(|err| {
@@ -232,14 +243,60 @@ impl UrlPattern {
             })?;
             format!("{}{QUERY_TAIL}", glob_to_url_regex(text, raw)?)
         } else {
-            format!("{}(?:[/?#].*)?$", regex::escape(text.trim_end_matches('/')))
+            let literal: String = text
+                .trim_end_matches('/')
+                .chars()
+                .map(encoded_literal)
+                .collect();
+            format!("{literal}(?:[/?#].*)?$")
         };
-        Ok(if absolute {
+        Ok(if absolute.is_some() {
             Self::Absolute(body)
         } else {
             Self::Relative(body)
         })
     }
+}
+
+/// An `http(s)://` pattern with its scheme and authority lowercased and a default port dropped,
+/// or `None` for a relative pattern.
+fn normalize_absolute_pattern(pattern: &str) -> Option<String> {
+    let (scheme, rest) = pattern.split_once("://")?;
+    let scheme = scheme.to_ascii_lowercase();
+    let default_port = match scheme.as_str() {
+        "http" => ":80",
+        "https" => ":443",
+        _ => return None,
+    };
+    let (authority, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
+    let authority = authority.to_ascii_lowercase();
+    let authority = authority.strip_suffix(default_port).unwrap_or(&authority);
+    Some(format!("{scheme}://{authority}{path}"))
+}
+
+/// Whether `url` percent-encodes `ch` in a path (the WHATWG path percent-encode set, non-ASCII,
+/// and the backslash, which special URLs turn into `/`).
+fn encoded_in_path(ch: char) -> bool {
+    !ch.is_ascii()
+        || ch.is_ascii_control()
+        || matches!(
+            ch,
+            ' ' | '"' | '#' | '<' | '>' | '?' | '^' | '`' | '{' | '}' | '\\'
+        )
+}
+
+/// A literal pattern character as a regex for its form in a percent-encoded URL path.
+fn encoded_literal(ch: char) -> String {
+    if ch == '\\' {
+        return "/".to_string();
+    }
+    if !encoded_in_path(ch) {
+        return regex::escape(ch.encode_utf8(&mut [0u8; 4]));
+    }
+    ch.encode_utf8(&mut [0u8; 4])
+        .bytes()
+        .map(|b| format!("%{b:02X}"))
+        .collect()
 }
 
 /// The anchored regexes of every pattern: one for an absolute pattern; for a relative one, one
@@ -265,9 +322,9 @@ fn pattern_regexes(
     Ok(out)
 }
 
-/// Translate a glob that `glob::Pattern::new` accepted into a regex with the same meaning on a URL
-/// path (glob 0.3 with default options: `*` and `?` also match `/`, case-sensitive), where no
-/// wildcard or class crosses into the query string or fragment.
+/// Translate a glob that `glob::Pattern::new` accepted into a regex with the same meaning on a
+/// percent-encoded URL path (glob 0.3 with default options: `*` and `?` also match `/`,
+/// case-sensitive), where no wildcard or class crosses into the query string or fragment.
 fn glob_to_url_regex(glob: &str, raw: &str) -> Result<String> {
     let chars: Vec<char> = glob.chars().collect();
     let mut out = String::with_capacity(glob.len() * 2);
@@ -275,7 +332,7 @@ fn glob_to_url_regex(glob: &str, raw: &str) -> Result<String> {
     while i < chars.len() {
         match chars[i] {
             '?' => {
-                out.push_str("[^?#]");
+                out.push_str(&format!("(?:[^?#%]|{ENCODED_CHAR})"));
                 i += 1;
             }
             '*' if chars.get(i + 1) == Some(&'*') => {
@@ -306,11 +363,11 @@ fn glob_to_url_regex(glob: &str, raw: &str) -> Result<String> {
                             "invalid glob pattern '{raw}': unclosed '['"
                         ))
                     })?;
-                out.push_str(&class_to_regex(&chars[first..close], negated));
+                out.push_str(&class_to_regex(&chars[first..close], negated, raw)?);
                 i = close + 1;
             }
             ch => {
-                out.push_str(&regex::escape(ch.encode_utf8(&mut [0u8; 4])));
+                out.push_str(&encoded_literal(ch));
                 i += 1;
             }
         }
@@ -318,31 +375,57 @@ fn glob_to_url_regex(glob: &str, raw: &str) -> Result<String> {
     Ok(out)
 }
 
-/// A glob character class (`a`, `a-z`; a reversed range matches nothing) as a regex class that
-/// never matches `?` or `#`.
-fn class_to_regex(members: &[char], negated: bool) -> String {
+/// One percent-encoded character: an encoded ASCII byte, or a UTF-8 lead byte and its
+/// continuation bytes.
+const ENCODED_CHAR: &str = "%[0-7][0-9A-Fa-f]|%[C-Fc-f][0-9A-Fa-f](?:%[89ABab][0-9A-Fa-f]){1,3}";
+
+/// A glob character class (`a`, `a-z`; a reversed range matches nothing) as a regex for one
+/// character of a percent-encoded path, never `?` or `#`. A member the path encodes is matched in
+/// its encoded form; a negated class or a range cannot express that and is rejected.
+fn class_to_regex(members: &[char], negated: bool, raw: &str) -> Result<String> {
+    let unsupported = |what: String| {
+        VaultError::Validation(format!(
+            "pattern '{raw}': {what} cannot match a percent-encoded URL path character by character"
+        ))
+    };
     let escape = |ch: char| regex::escape(ch.encode_utf8(&mut [0u8; 4]));
     let mut set = String::new();
+    let mut encoded = Vec::new();
     let mut i = 0usize;
     while i < members.len() {
         if i + 2 < members.len() && members[i + 1] == '-' {
             let (lo, hi) = (members[i], members[i + 2]);
             if lo <= hi {
+                if (lo..=hi).any(encoded_in_path) {
+                    return Err(unsupported(format!("the range '{lo}-{hi}'")));
+                }
                 set.push_str(&format!("{}-{}", escape(lo), escape(hi)));
             }
             i += 3;
         } else {
-            set.push_str(&escape(members[i]));
+            let ch = members[i];
+            if encoded_in_path(ch) {
+                if negated {
+                    return Err(unsupported(format!("the negated class member '{ch}'")));
+                }
+                encoded.push(encoded_literal(ch));
+            } else {
+                set.push_str(&escape(ch));
+            }
             i += 1;
         }
     }
     if negated {
-        format!("[^?#{set}]")
-    } else if set.is_empty() {
-        NO_CHAR.to_string()
-    } else {
-        format!("[[{set}]&&[^?#]]")
+        return Ok(format!("(?:[^?#%{set}]|{ENCODED_CHAR})"));
     }
+    let mut alternatives = encoded;
+    if !set.is_empty() {
+        alternatives.insert(0, format!("[[{set}]&&[^?#]]"));
+    }
+    Ok(match alternatives.len() {
+        0 => NO_CHAR.to_string(),
+        _ => format!("(?:{})", alternatives.join("|")),
+    })
 }
 
 /// The record of one web Sync, logged as one `web_sync_summary` line when the Sync ends: the page
@@ -1183,10 +1266,20 @@ mod scope_tests {
         row(ROOT, &["Docs/*"], &[], "https://ex.com/docs/a", false, false),
         // The Origin page is crawled for its links even when no include stores it.
         row(ROOT, &["docs/*"], &[], "https://ex.com/", false, true),
+        // Patterns match the percent-encoded URL; their literal characters are encoded the same way.
+        row(ROOT, &["my docs/*"], &[], "https://ex.com/my%20docs/a", true, true),
+        row(ROOT, &["docs/é*"], &[], "https://ex.com/docs/%C3%A9a", true, true),
+        row(ROOT, &["docs/v?"], &[], "https://ex.com/docs/v%C3%A9", true, true),
+        row(ROOT, &["docs/[^a]*"], &[], "https://ex.com/docs/%5Ex", true, true),
+        row(ROOT, &["docs/my%20*"], &[], "https://ex.com/docs/my%20a", true, true),
+        // An absolute pattern's scheme and host are case-insensitive; a default port is implied.
+        row(ROOT, &["HTTPS://Ex.com/docs"], &[], "https://ex.com/docs/a", true, true),
+        row(ROOT, &["https://ex.com:443/docs/*"], &[], "https://ex.com/docs/a", true, true),
     ];
 
-    /// What spider's own allow-list check says about `url` for a crawler configured from `scope`.
-    /// `None` when spider failed to compile a non-empty allow list and silently dropped it.
+    /// Whether spider's own allow-list check admits `url` for a crawler configured from `scope`,
+    /// and which of its compiled sets ("whitelist", "blacklist") came out empty: spider silently
+    /// drops a set that fails to compile.
     fn spider_admits(origin: &Url, scope: &WebScope, url: &str) -> (bool, Vec<&'static str>) {
         let mut site = configure_website(origin, scope, 100, 10, false);
         site.configuration.configure_allowlist();
@@ -1239,7 +1332,8 @@ mod scope_tests {
         );
     }
 
-    /// A relative pattern's regex means what `glob::Pattern::matches` means on a URL path.
+    /// A relative pattern's regex, run on the percent-encoded path a real URL has, means what
+    /// `glob::Pattern::matches` means on the decoded path.
     #[test]
     fn relative_pattern_regex_matches_like_glob() {
         let patterns = [
@@ -1272,6 +1366,13 @@ mod scope_tests {
             "Docs/*",
             "docs/é*",
             "docs/*/index",
+            "my docs/*",
+            "docs/?",
+            "docs/??",
+            "docs/[!a]",
+            "docs/[!a]*",
+            "docs/[é]x",
+            "docs/[{a]x",
         ];
         let paths = [
             "docs",
@@ -1303,16 +1404,20 @@ mod scope_tests {
             "docs/*x",
             "docs/ax",
             "d.cs/(x)|+{1}$^",
-            "docs/\\x",
             "docs/dx",
             "docs/&x",
             "docs/~x",
             "Docs/a",
             "docs/éa",
+            "docs/é",
+            "docs/éé",
+            "docs/ x",
+            "docs/{x",
+            "docs/a",
+            "my docs/a",
             "docs/a/index",
             "docs/a/b/index",
             "",
-            "%20/docs",
         ];
         let mut failures = Vec::new();
         for pattern in patterns {
@@ -1324,10 +1429,13 @@ mod scope_tests {
             };
             let regex = regex::Regex::new(&format!("^{body}")).expect("regex");
             for path in paths {
-                let (by_glob, by_regex) = (glob.matches(path), regex.is_match(path));
+                let mut url = Url::parse(ROOT).expect("root");
+                url.set_path(path);
+                let encoded = url.path().trim_start_matches('/');
+                let (by_glob, by_regex) = (glob.matches(path), regex.is_match(encoded));
                 if by_glob != by_regex {
                     failures.push(format!(
-                        "{pattern} on {path:?}: glob {by_glob}, regex {by_regex}"
+                        "{pattern} on {path:?} ({encoded}): glob {by_glob}, regex {by_regex}"
                     ));
                 }
             }
@@ -1338,7 +1446,21 @@ mod scope_tests {
     #[test]
     fn patterns_glob_rejects_are_validation_errors() {
         let origin = Url::parse(ROOT).expect("origin");
-        for bad in ["docs/**x", "a***", "docs/[", "docs/[!]", "  ", "/"] {
+        for bad in [
+            "docs/**x",
+            "a***",
+            "docs/[",
+            "docs/[!]",
+            "  ",
+            "/",
+            // A query string: patterns match the path only.
+            "https://ex.com/search?q=rust",
+            "search?q=*",
+            "list?a=1&b=*",
+            // Classes that a percent-encoded path cannot express as one character.
+            "docs/[!é]*",
+            "docs/[ -~]*",
+        ] {
             let err = WebScope::new(&origin, &[bad.to_string()], &[]).expect_err(bad);
             assert!(
                 matches!(err, crate::error::VaultError::Validation(_)),
