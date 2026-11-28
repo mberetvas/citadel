@@ -123,3 +123,62 @@ Callers:
 **Blocking reads run in `spawn_blocking`.** One helper in `ui/api.rs` wraps every handler's read, including `/api/query` and the source resolution before `sync`/`DELETE`. There is no unit test: a blocked worker is not observable through `oneshot`. The evidence is the code review, plus the measurement in Findings.
 
 **Follow-ups, not done here:** MCP `query` creates the vault on a missing path (`mcp/mod.rs:196`, outside this task's region). The `exists()` checks in `sources/mod.rs` (four) already follow the decided rule; folding them into the module means touching `sources/`.
+
+## HumanAudit
+
+**Commits** (on top of `main` @ 116f42c):
+- `3f4c311` docs(tasks): findings and plan for one Source/Page read module
+- `993a156` refactor(ingest): one read module for Sources and Pages
+- `4d51414` feat(ui): serve every Page list from GET /api/pages
+- `b3a06c4` docs(spec): document GET /api/pages and the read module
+- `f19538d` style(ingest): keep PageStatuses::parse stable under rustfmt
+
+**Changed files:**
+- `src/ingest/read.rs` (new)
+- `src/ingest/mod.rs`
+- `src/daemon/mod.rs`
+- `src/ui/api.rs`
+- `src/ui/mod.rs`
+- `src/ui/assets/app.js`
+- `Docs/SPEC.md` (§2 layout, §7)
+- `Docs/AtomicTasks/fix-read-module.md`
+
+`src/cli/mod.rs` needed no change: `list`/`show` call the same `ingest::list_sources`/`show_source`, which are now backed by the module.
+
+**Edits outside the stated region** (`daemon/mod.rs` beyond the two SELECTs):
+- The import block (lines 14, 20 and 22: `rusqlite::Connection`, `open_rw_db`, `map_source_record`). This is a likely merge-conflict hotspot with `fix-daemon-supervision`.
+- The public `select_due_web_sources` and `select_due_web_sources_at` were removed. Nothing else used them.
+- Their two tests (`selects_only_due_web_sources`, `failed_sync_waits_for_refresh_interval`) moved into `ingest::read::tests`, with the same assertions.
+
+No hunk touches lines 128-246.
+
+**Red, then green:**
+- All 13 `ingest::read::tests::*` were red against `todo!()` stubs, then green.
+- `ui::tests::all_sources_page_list_has_http_status_and_no_cap`: red because the route did not exist, then green.
+- `ui::tests::ui_assets_read_page_lists_from_the_server`: red because `app.js` still had `queryAllSourcePages`, then green.
+- `ui::tests::ui_assets_include_browser_error_banner_and_drilldown`: its assertion changed from `hasFailingHttp` to `status === "error"`.
+
+**Evidence block:**
+- **Checks:**
+  - `cargo fmt --check`: OK.
+  - `cargo clippy --all-targets -- -D warnings`: clean.
+  - `cargo clippy --no-default-features --all-targets -- -D warnings`: clean.
+  - `cargo test`: 317 lib tests plus 17 integration tests (3+4+8+1+1) passed, 0 failed.
+  - `dropped_sync_future_still_finishes_in_background` did not fail in this run. No flake was observed.
+- **Live / Visual Evidence:**
+  - A tempdir `CITADEL_HOME`/`HOME` vault, with 2 local Sources and 4 Pages (one `error` with HTTP 404, one `stale`), served by `citadel ui` on port 63542, using this branch's own binary.
+  - `GET /api/pages` returned all 4 Pages with `http_status` and `source_name`.
+  - `?status=stale,error&q=api/v2` returned the 404 Page, matched through its URI.
+  - `?status=bogus` returned 400.
+  - `?q=tokio-runtime` returned the 404 Page and no error.
+  - CLI `show sample-docs` listed the error and stale Pages.
+  - On a missing vault, CLI `list` printed "No sources registered." and `show x` gave NotFound. Neither created the vault directory.
+- **Screenshots Inspected:**
+  - Sources, Browser (All sources, with the error Page selected: `HTTP 404` badge plus the "Fetch error" banner), Browser filtered to one Source, Changes & Health (dark; the Stale & Error table comes from `/api/pages`), SQL, and mobile 480 px.
+  - All were rendered in dark mode, because the host is in dark mode. Light mode was not rendered.
+- **Open Risks / Assumptions:**
+  - The All-sources list has no row cap. A large vault (about 10k Pages) means about 3 MB of JSON and that many DOM rows. Paging is a follow-up.
+  - Search behaviour changed. There is no content-substring LIKE match any more. Words match as FTS5 phrases (stemmed, with `*` prefix) or as a URI substring, and FTS5 operators typed in the Browser are matched as words.
+  - MCP `query` still creates the vault on a missing path (`mcp/mod.rs:196`, outside this region). The four `exists()` checks in `sources/mod.rs` follow the same rule, but they are not yet routed through the module.
+  - `spawn_blocking` for UI reads is verified by code review only. `oneshot` tests cannot observe a blocked worker.
+  - `loadRecentChanges` (fixed `v_recent_changes` SQL) and the SQL Explorer presets still use `/api/query`. They are not Page-list reads.
