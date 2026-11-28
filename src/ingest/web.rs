@@ -228,6 +228,12 @@ impl UrlPattern {
                 "include/exclude pattern must not be empty".into(),
             ));
         }
+        if text.contains('#') {
+            return Err(VaultError::Validation(format!(
+                "pattern '{raw}' contains '#'; patterns match only the URL path (fragments are \
+                 ignored), so remove the '#...' part"
+            )));
+        }
         // A `?` followed by `=` or `&` within the same path segment reads as a query string; a
         // `=` or `&` in a later segment is an ordinary path character.
         let query_like = text.split('?').skip(1).any(|after| {
@@ -1481,6 +1487,11 @@ mod scope_tests {
             "search?q=*",
             "list?a=1&b=*",
             "docs/v?/x?q=1",
+            // A fragment: patterns match the path only.
+            "docs/page#intro",
+            "https://ex.com/docs#*",
+            "docs/*#",
+            "#top",
             // Classes that a percent-encoded path cannot express as one character.
             "docs/[!é]*",
             "docs/[ -~]*",

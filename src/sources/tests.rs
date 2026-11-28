@@ -178,23 +178,27 @@ async fn web_source_patterns_are_validated_on_add_and_update() {
         ..Default::default()
     };
 
-    let err = lifecycle.add(web("api/**x"), false).await.unwrap_err();
-    assert!(matches!(err, VaultError::Validation(_)), "{err}");
+    for bad in ["api/**x", "api/page#intro"] {
+        let err = lifecycle.add(web(bad), false).await.unwrap_err();
+        assert!(matches!(err, VaultError::Validation(_)), "{bad}: {err}");
+    }
 
     lifecycle
         .add(web("api/[!d]*"), false)
         .await
         .expect("valid web patterns");
-    let err = lifecycle
-        .update(
-            "example-com-docs",
-            UpdateSourceParams {
-                exclude_patterns: Some(vec!["api/[".into()]),
-                ..Default::default()
-            },
-        )
-        .unwrap_err();
-    assert!(matches!(err, VaultError::Validation(_)), "{err}");
+    for bad in ["api/[", "api/*#top"] {
+        let err = lifecycle
+            .update(
+                "example-com-docs",
+                UpdateSourceParams {
+                    exclude_patterns: Some(vec![bad.into()]),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err, VaultError::Validation(_)), "{bad}: {err}");
+    }
 }
 
 #[tokio::test]
