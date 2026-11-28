@@ -3,7 +3,7 @@
 use std::path::Path;
 
 use super::report::{Check, Section};
-use crate::daemon::supervision::ServiceState;
+use crate::daemon::supervision::{ServiceState, RESTART_HINT};
 use crate::daemon::DaemonStatus;
 
 /// Map the daemon pid-file status to a check row.
@@ -29,7 +29,13 @@ pub fn daemon_running_check(status: DaemonStatus, pid_path: &Path) -> Check {
 }
 
 /// Turn the gathered service state into check rows.
-pub fn service_checks(state: &ServiceState, cli_data_dir: &Path, cli_exe: &Path) -> Vec<Check> {
+/// `daemon_running`: a daemon holds this vault's lock.
+pub fn service_checks(
+    state: &ServiceState,
+    cli_data_dir: &Path,
+    cli_exe: &Path,
+    daemon_running: bool,
+) -> Vec<Check> {
     const NAME: &str = "service";
     match state {
         ServiceState::Unsupported => vec![Check::info(
@@ -65,7 +71,11 @@ pub fn service_checks(state: &ServiceState, cli_data_dir: &Path, cli_exe: &Path)
                     .data_dir
                     .as_deref()
                     .is_some_and(|dir| crate::fsutil::same_path(dir, cli_data_dir));
-                let hint = if this_vault {
+                let hint = if this_vault && daemon_running {
+                    // A detached daemon (e.g. one an older citadel spawned beside the
+                    // service) holds the lock, so `start` alone would refuse.
+                    RESTART_HINT
+                } else if this_vault {
                     "citadel daemon start"
                 } else {
                     "citadel daemon install"
@@ -312,6 +322,7 @@ mod tests {
             &ServiceState::Unsupported,
             Path::new("/data"),
             Path::new("/bin/c"),
+            false,
         );
         assert_eq!(checks.len(), 1);
         assert_eq!(checks[0].status, CheckStatus::Info);
@@ -324,6 +335,7 @@ mod tests {
             &ServiceState::NotInstalled,
             Path::new("/data"),
             Path::new("/bin/c"),
+            false,
         );
         assert!(!checks.is_empty());
         assert!(checks.iter().all(|c| c.status == CheckStatus::Info));
@@ -335,6 +347,7 @@ mod tests {
             &installed("/bin/c", "/data", true),
             Path::new("/data"),
             Path::new("/bin/c"),
+            false,
         );
         assert!(checks.iter().all(|c| c.status == CheckStatus::Ok));
     }
@@ -346,11 +359,24 @@ mod tests {
             &installed("/bin/c", "/data", false),
             Path::new("/data"),
             Path::new("/bin/c"),
+            false,
         );
         assert_eq!(checks.len(), 1, "{checks:?}");
         assert_eq!(checks[0].status, CheckStatus::Info);
         assert!(checks[0].detail.contains("not loaded"));
         assert_eq!(checks[0].hint.as_deref(), Some("citadel daemon start"));
+    }
+
+    #[test]
+    fn service_not_loaded_beside_a_running_daemon_hints_restart() {
+        // A detached daemon holds the lock: `citadel daemon start` alone would refuse.
+        let checks = service_checks(
+            &installed("/bin/c", "/data", false),
+            Path::new("/data"),
+            Path::new("/bin/c"),
+            true,
+        );
+        assert_eq!(checks[0].hint.as_deref(), Some(RESTART_HINT), "{checks:?}");
     }
 
     #[test]
@@ -361,6 +387,7 @@ mod tests {
             &installed("/bin/c", "/other", false),
             Path::new("/data"),
             Path::new("/bin/c"),
+            false,
         );
         let row = checks
             .iter()
@@ -375,6 +402,7 @@ mod tests {
             &installed("/bin/c", "/other", true),
             Path::new("/data"),
             Path::new("/bin/c"),
+            false,
         );
         let warn = checks
             .iter()
@@ -392,6 +420,7 @@ mod tests {
             &installed("/old/c", "/data", true),
             Path::new("/data"),
             Path::new("/bin/c"),
+            false,
         );
         let warn = checks
             .iter()
@@ -406,7 +435,7 @@ mod tests {
         let state = ServiceState::Unknown {
             reason: "no home directory".to_string(),
         };
-        let checks = service_checks(&state, Path::new("/data"), Path::new("/bin/c"));
+        let checks = service_checks(&state, Path::new("/data"), Path::new("/bin/c"), false);
         assert_eq!(checks.len(), 1);
         assert_eq!(checks[0].status, CheckStatus::Warn);
         assert!(checks[0].detail.contains("no home directory"));
@@ -423,7 +452,7 @@ mod tests {
         file.data_dir = None;
         file.unreadable = Some("permission denied".to_string());
         let state = ServiceState::Installed { file, loaded };
-        let checks = service_checks(&state, Path::new("/data"), Path::new("/bin/c"));
+        let checks = service_checks(&state, Path::new("/data"), Path::new("/bin/c"), false);
         let warn = checks
             .iter()
             .find(|c| c.status == CheckStatus::Warn)

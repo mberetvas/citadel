@@ -110,9 +110,9 @@ pub async fn run_doctor(config: &VaultConfig, opts: &DoctorOpts) -> Report {
         .iter()
         .any(|i| i.http_url() == Some(opts.serve_url.as_str()));
 
-    // Daemon state feeds a Version row and a Running row.
-    let (daemon_version_rows, daemon_running_row) = if opts.in_container {
-        (None, None)
+    // Daemon state feeds a Version row, a Running row and the service row's hint.
+    let (daemon_version_rows, daemon_running_row, daemon_running) = if opts.in_container {
+        (None, None, false)
     } else {
         match version::gather_daemon_facts(config) {
             Ok(facts) => (
@@ -121,6 +121,7 @@ pub async fn run_doctor(config: &VaultConfig, opts: &DoctorOpts) -> Report {
                     facts.status,
                     &config.pid_path(),
                 )),
+                matches!(facts.status, crate::daemon::DaemonStatus::Running(_)),
             ),
             Err(err) => (
                 None,
@@ -135,6 +136,7 @@ pub async fn run_doctor(config: &VaultConfig, opts: &DoctorOpts) -> Report {
                         config.pid_path().display()
                     )),
                 ),
+                false,
             ),
         }
     };
@@ -151,6 +153,7 @@ pub async fn run_doctor(config: &VaultConfig, opts: &DoctorOpts) -> Report {
             service,
             &config.data_dir,
             &opts.current_exe,
+            daemon_running,
         ));
         checks.push(running::process_check(&running::gather_processes()));
     } else {

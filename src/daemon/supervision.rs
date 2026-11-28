@@ -46,7 +46,7 @@ pub enum ServiceState {
     Unknown {
         reason: String,
     },
-    /// `loaded`: the manager has the job registered (launchd: loaded; systemd: enabled).
+    /// `loaded`: launchd has the job loaded; systemd runs the unit (`is-active`).
     Installed {
         file: ServiceFile,
         loaded: bool,
@@ -209,26 +209,40 @@ impl Supervision {
         let stop_error = self
             .stop_as(supervised, Some(self.stop_timeout), &mut |_| Wait::Continue)
             .err();
-        // A service manager this vault does not recognise as its own (a plist that names no
-        // vault, a moved vault) may still relaunch the daemon: give it a moment before a
-        // spawned daemon would fight it for the lock. A supervised daemon's service is
-        // stopped, so nothing relaunches it.
-        if !supervised && stop_error.is_none() {
-            match self.relaunched_within(self.relaunch_grace) {
-                Ok(Some(pid)) => return Restart::Relaunched(pid),
-                Ok(None) => {}
-                Err(err) => return Restart::StatusUnknown(err),
-            }
-        }
+        self.restart_after_stop(old_pid, supervised, stop_error)
+    }
+
+    /// The second half of [`Supervision::restart`], once the stop returned `stop_error`.
+    fn restart_after_stop(
+        &self,
+        old_pid: u32,
+        supervised: bool,
+        stop_error: Option<VaultError>,
+    ) -> Restart {
         match daemon_status(&self.config) {
             Ok(DaemonStatus::Running(pid)) if pid == old_pid => {
                 Restart::NotStopped { pid, stop_error }
             }
             Ok(DaemonStatus::Running(pid)) => Restart::Relaunched(pid),
-            Ok(DaemonStatus::Stopped | DaemonStatus::Stale) => match self.start_as(supervised) {
-                Ok(started) => Restart::Started(started),
-                Err(error) => Restart::StartFailed { supervised, error },
-            },
+            Ok(DaemonStatus::Stopped | DaemonStatus::Stale) => {
+                // A service manager this vault does not recognise as its own (a plist that
+                // names no vault, a moved vault) may still relaunch the daemon: give it a
+                // moment before a spawned daemon would fight it for the lock, also when the
+                // daemon exited just after the stop timed out. A supervised daemon is
+                // started again by reloading its service, which also replaces a daemon the
+                // service relaunched.
+                if !supervised {
+                    match self.relaunched_within(self.relaunch_grace) {
+                        Ok(Some(pid)) => return Restart::Relaunched(pid),
+                        Ok(None) => {}
+                        Err(err) => return Restart::StatusUnknown(err),
+                    }
+                }
+                match self.start_as(supervised) {
+                    Ok(started) => Restart::Started(started),
+                    Err(error) => Restart::StartFailed { supervised, error },
+                }
+            }
             Err(err) => Restart::StatusUnknown(err),
         }
     }
@@ -305,16 +319,17 @@ impl Supervision {
             Exit::Relaunched(by) => Some(by),
             Exit::Aborted => return Ok(Stopped::StillDraining { pid, supervised }),
             Exit::TimedOut => {
+                // Only a restart sets a limit, so the advice is about getting the daemon
+                // running again, not about stopping it.
                 let next = if supervised {
-                    " Its OS service relaunches it when it exits; run `citadel daemon stop` \
-                     again then."
+                    " Its OS service, left running, relaunches it when it exits."
                 } else {
                     ""
                 };
                 return Err(VaultError::Other(format!(
                     "sent SIGTERM to daemon (pid {pid}), but it did not exit within {} seconds; \
                      a daemon finishing a Sync exits once the Sync is done.{next}",
-                    self.stop_timeout.as_secs()
+                    limit.unwrap_or_default().as_secs()
                 )));
             }
         };
@@ -1162,6 +1177,31 @@ mod tests {
         rig.world().relaunch_delay = Duration::from_millis(100);
         let old = rig.running().expect("running");
         let restart = rig.supervision().restart(old);
+        let by = rig.running().expect("relaunched");
+        assert!(
+            matches!(restart, Restart::Relaunched(p) if p == by),
+            "{restart:?}"
+        );
+        assert_eq!(
+            rig.world().spawns,
+            0,
+            "a second daemon would fight for the lock"
+        );
+    }
+
+    #[test]
+    fn restart_waits_for_a_relaunch_after_a_timed_out_stop() {
+        // The stop timed out, then the daemon finished its Sync and exited before the
+        // restart looked again; launchd relaunches it shortly after.
+        let rig = Rig::new().with_service(None, true);
+        rig.world().relaunch_delay = Duration::from_millis(100);
+        let old = rig.running().expect("running");
+        rig.fake.exit(rig.world());
+        let restart = rig.supervision().restart_after_stop(
+            old,
+            false,
+            Some(VaultError::Other("did not exit within 5 seconds".into())),
+        );
         let by = rig.running().expect("relaunched");
         assert!(
             matches!(restart, Restart::Relaunched(p) if p == by),

@@ -341,3 +341,19 @@ Not verified live: the real Ctrl-C handling, and the waiting line during a real 
 Both need a running daemon that is syncing, and only the fake exercised them. With the
 handler installed, Ctrl-C does not end `citadel daemon stop`; the second press is handled
 the same way, and the process ends once the stop returns.
+
+## Second review
+
+Review of `116f42c..844aedf` (claude-opus-5-5, `/code-review` medium `--fix`), checked by hand.
+The two bug fixes were red first.
+
+| # | Finding | Severity | Status |
+|---|---|---|---|
+| 1 | `restart` skipped the 1 s relaunch grace when the stop had timed out. An unsupervised daemon that exits just after those 5 s got a spawned twin fighting a relaunch for the lock (`supervision.rs`, `restart`). | important | Applied: the grace now runs whenever the lock is free, before an unsupervised start. Red test `restart_waits_for_a_relaunch_after_a_timed_out_stop`, through the new `restart_after_stop` seam (old guard: `Started(Spawned(..))`). A supervised daemon gets no grace: its reload's `bootout` also ends a daemon its service relaunched. |
+| 2 | The timeout error inside update's warning said "run `citadel daemon stop` again", next to "run `citadel daemon start`", and printed `stop_timeout` instead of the limit passed. | nit | Applied: it now says only that the service, left running, relaunches the daemon, and prints the limit. |
+| 3 | `ServiceState::Installed.loaded` doc said "systemd: enabled" after finding 5 went back to `is-active`. | nit | Applied. |
+| 4 | Doctor hinted `citadel daemon start` for this vault's unloaded service while a detached daemon held the lock, so that start refuses (`doctor/running.rs`, `service_checks`). | nit | Applied: `service_checks` takes `daemon_running`, and the hint becomes `RESTART_HINT`. Red test `service_not_loaded_beside_a_running_daemon_hints_restart`. |
+| 5 | `citadel daemon stop` exits 0 on `Stopped::StillDraining` (Ctrl-C), so `stop && start` runs a start that refuses. | nit | Deferred: the exit code of the user-chosen Ctrl-C path is the user's call. Today's cost is a harmless "already running" error. |
+| 6 | Ctrl-C is swallowed outside the drain wait (`settled_status`, service stop, `wait_until_free`), up to 5 s each. | nit | Deferred: the delay is bounded. A cheap fix would install the handler on the first `on_wait` call. |
+| 7 | No version bump. | nit | Not applied, as instructed: bump at merge time. |
+| 8 | The service stop can cut off a fresh Sync in a daemon `KeepAlive` relaunched during the drain. | pre-existing | Deferred: already under Remaining risks. |
