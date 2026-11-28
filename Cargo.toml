@@ -1,6 +1,6 @@
 [package]
 name = "citadel"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 description = "Local knowledge vault and MCP server for web documentation and Markdown folders"
 license = "Apache-2.0"
