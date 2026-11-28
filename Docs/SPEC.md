@@ -104,10 +104,19 @@ src/
     mod.rs           # Source lifecycle: async-only `SourceLifecycle` (add, update, remove, sync,
                      # sync_all); registration, slugging, origin classification, limits.
                      # Every entry point (CLI, MCP, UI, daemon) goes through it.
+    sync.rs          # One Sync = one task from claim to release (`start_sync` -> `SyncHandle`);
+                     # dropping the handle neither cancels the Sync nor leaks its claim
+    sync_run.rs      # `SyncRun`: opened once after the claim, closed once (ok in the page
+                     # transaction, or error)
+    claim.rs         # Sync claims (ADR-0001); `ClaimGuard` is built in the hop that commits the row
+                     # a claim of ours with no live guard (failed release) is taken over
+    driver.rs        # `SyncDriver` seam: folder walk or web crawl, returning page outcomes only
+    origin.rs        # Origin classification + the Private-origin rule
   ingest/
     mod.rs           # Source/Page record types, row mappers, read views (list/show)
-    web.rs           # spider + spider_transformations integration
-    local.rs         # Local Markdown folder walker + frontmatter stripping
+    persist.rs       # Writes a Sync's page outcomes (`SyncPages`): pages, sections, diffs, stale
+    web.rs           # Web-crawl driver: spider + spider_transformations integration
+    local.rs         # Folder-walk driver: Local Markdown walker + frontmatter stripping
     normalize.rs     # Noise stripping, SHA-256 hashing, unified diff generation
     sections.rs      # pulldown-cmark heading splitter (H1-H3 breadcrumbs)
   mcp/
@@ -282,7 +291,7 @@ Every SQL statement executed through MCP passes **four layers of defense**:
      - Later crawls size their remaining budget by documents, counting an `X`/`X.md` pair once (`count_scoped_documents`). The cut-off rule still counts every storable URL and every result, `Retired` included (`count_scoped_urls`), because spider's limit counts every fetch; erring toward cut-off keeps unvisited pages.
 3. **Stale Detection:** Track the set of URIs seen during a full sync run. Any previously `active` page for that source **not** seen in the completed crawl is marked `status = 'stale'` (never silently deleted). Pages returning 4xx/5xx are marked `status = 'error'` with `http_status` and `error_message` while preserving their last good `content_md`.
    - **Cut-off rule** (`is_cut_off`): a Sync is **cut off** when its first crawl used up `max_pages` (pages delivered plus pages lost by the receiving task), or when the distinct storable pages it collected, or its results (stored, failed, or merged copies, one per page: a redirect's extra result for its requested URL is left out), reach `max_pages`, whether or not those pages were stored. Without `--prune`, a cut-off Sync leaves unvisited pages as they were; a complete Sync marks them stale. With `--prune`, missing pages are deleted either way.
-4. **Sync summary line:** every web Sync whose Origin is a valid URL logs one `web_sync_summary` line at `info` when it ends, whether it succeeds or fails (`sync_web_source_with_accounting`). Text values are quoted. It carries, in order: `source`, `origin`, `ok`, `max_pages`, `cut_off`, `delay_ms` (the delay spider reports after the first crawl), `pages_received` (every page any crawler delivered), `results_stored`, `results_failed`, `lost_by_listener` (pages missed because the receiving task fell behind), the pages that got no result, each under the first reason it meets (`unparsable_url`, `already_collected`, `redirected_out_of_scope`, `url_not_storable`, `duplicate_result`, `markdown_twin`, `canonical_duplicate`, `url_alias`, `binary_file`), `later_crawls_started`, and the step durations `discovery_ms`, `first_crawl_ms`, `later_crawls_ms`, `conversion_ms`, `write_ms` (`-` for a step the Sync never reached). When every crawl finishes, `pages_received` equals the results plus the nine drop counts; a Sync whose crawl failed can have fewer, because its pages are never converted. A step that ran and failed still has its duration.
+4. **Sync summary line:** every web Sync whose Origin is a valid URL logs one `web_sync_summary` line at `info` when it ends, whether it succeeds or fails: the web driver (`web::collect`) logs it when the crawl fails, otherwise its `on_written` hook logs it once the Source lifecycle has written the pages, with `ok` and `write_ms` for that write. Text values are quoted. It carries, in order: `source`, `origin`, `ok`, `max_pages`, `cut_off`, `delay_ms` (the delay spider reports after the first crawl), `pages_received` (every page any crawler delivered), `results_stored`, `results_failed`, `lost_by_listener` (pages missed because the receiving task fell behind), the pages that got no result, each under the first reason it meets (`unparsable_url`, `already_collected`, `redirected_out_of_scope`, `url_not_storable`, `duplicate_result`, `markdown_twin`, `canonical_duplicate`, `url_alias`, `binary_file`), `later_crawls_started`, and the step durations `discovery_ms`, `first_crawl_ms`, `later_crawls_ms`, `conversion_ms`, `write_ms` (`-` for a step the Sync never reached). When every crawl finishes, `pages_received` equals the results plus the nine drop counts; a Sync whose crawl failed can have fewer, because its pages are never converted. A step that ran and failed still has its duration.
 5. **Budget warning** (`budget_warning`): a cut-off Sync whose pages redirected outside the Source number at least 5 and more than 10 % of the pages received adds one warning to its Sync summary. It gives the count, up to three requested URLs, says they count against `max_pages`, and suggests raising `max_pages` or excluding that section. The CLI prints it; the UI and MCP receive it in the Sync summary. The thresholds are open ([design](./egm/2026-11-24-sync-measurement-one-request-per-url-design.md) Q2).
 
 **Planned: robots.txt** (later design, not yet drafted; decided in [concepts_brief.md](./egm/concepts_brief.md), "Direction from the author"):
@@ -407,7 +416,8 @@ To eliminate false-positive diffs (such as volatile `created:` / `updated:` / `c
   - `remove` returns the deleted source name and page count; `add`/`sync` returns structured sync summary (`pages_added`, `pages_updated`, `pages_unchanged`, `pages_stale`, `pages_failed`).
   - `sync` without `name` syncs every Source independently and also returns `results`: one entry per Source with `outcome` `synced` (plus `summary`), `already_syncing`, or `error` (plus `error`). A failed Source never stops the others.
   - A Source whose Sync claim is held elsewhere is not synced or removed: `sync`/`remove` return `outcome: "already_syncing"` with `isError: false`.
-  - Every failed Sync, from any entry point, records an error Sync run and sets the Source's `status = 'error'` and `last_error`.
+  - Every failed Sync, from any entry point, records an error Sync run and sets the Source's `status = 'error'` and `last_error` once its Sync run is open. A failure before that (the Source is missing, or the run cannot be opened) records nothing and releases the Sync claim before the error returns.
+  - Each Sync records exactly one Sync run. A Sync runs as its own task from claim to release, so a caller that disconnects (MCP HTTP, the UI's `POST /api/sources/{id}/sync`, a timed-out client) neither cancels it nor leaves its Sync claim behind.
 - **Error response (both tools):** `isError: true` with an actionable error message (e.g., `"Write operations are disabled on MCP query tool"`, `"no such column: ..."`, or `"origin must be an http(s) URL or existing directory"`), enabling immediate LLM self-correction.
 
 ---

@@ -466,8 +466,8 @@ async fn scheduled_sync(
 
     let name = source.name.clone();
     let origin = source.origin.clone();
-    let claimed = match lifecycle.claim_record(source).await {
-        Ok(Some(claimed)) => claimed,
+    let running = match lifecycle.start_sync_record(source, false).claimed().await {
+        Ok(Some(running)) => running,
         Ok(None) => {
             tracing::debug!(source = %name, "skipped: already syncing");
             return;
@@ -478,7 +478,8 @@ async fn scheduled_sync(
         }
     };
     tracing::info!(source = %name, origin = %origin, "starting scheduled web sync");
-    match claimed.run(false).await {
+    // Waiting for the end keeps the semaphore permit until the Sync finishes.
+    match running.finish().await {
         Ok(summary) => log_sync_summary(&summary, "scheduled web sync complete"),
         Err(err) => {
             tracing::warn!(source = %name, error = %err, "scheduled web sync failed");

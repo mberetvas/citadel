@@ -2,6 +2,7 @@
 mod browser;
 pub mod local;
 pub mod normalize;
+pub(crate) mod persist;
 pub mod sections;
 pub mod web;
 
@@ -12,13 +13,13 @@ use crate::config::VaultConfig;
 use crate::db::open_rw_db;
 use crate::error::{Result, VaultError};
 
-pub use local::{canonicalize_local_dir, sync_local_source, SyncSummary};
+pub use local::canonicalize_local_dir;
 pub use normalize::{
     count_words, extract_title, normalize_markdown, normalize_whitespace, sha256_hex,
     strip_volatile_frontmatter, unified_diff, NormalizedDocument, MAX_DIFF_BYTES,
 };
+pub use persist::SyncSummary;
 pub use sections::{split_sections, SectionChunk};
-pub use web::sync_web_source;
 
 pub(crate) const DEFAULT_MAX_PAGES: u32 = 500;
 pub(crate) const DEFAULT_MAX_DEPTH: u32 = 5;

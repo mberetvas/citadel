@@ -281,13 +281,13 @@ mod tests {
             )
             .await
             .expect("register");
-        let mut held = lifecycle
+        let held = lifecycle
             .claim("busy")
             .await
             .expect("claim")
             .expect("claim is free");
 
-        let app = build_router(config);
+        let app = build_router(config.clone());
         for (method, uri) in [
             (Method::POST, "/api/sources/busy/sync"),
             (Method::DELETE, "/api/sources/busy"),
@@ -305,7 +305,8 @@ mod tests {
                 .expect("response");
             assert_eq!(resp.status(), StatusCode::CONFLICT, "{method} {uri}");
         }
-        held.release().await;
+        held.release(&crate::db::open_rw_db(&config.db_path()).expect("open db"))
+            .expect("release");
 
         let resp = app
             .oneshot(

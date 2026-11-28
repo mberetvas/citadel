@@ -4,17 +4,22 @@
 //! releases it, so every process sharing the vault sees the same claims. A claim left
 //! behind by a crash may be taken over when its holder pid is not running, when the pid
 //! is ours but the instance token is not (a previous run reused the pid, e.g. pid 1 in
-//! the container), or when it is older than [`MAX_CLAIM_AGE_SECS`].
+//! the container), or when it is older than [`MAX_CLAIM_AGE_SECS`]. A claim with our own
+//! pid and token is taken over only when no live guard of this process holds it (its
+//! release failed); the in-process registry [`LiveGuards`] judges that.
 //!
 //! [ADR-0001]: ../../../Docs/adr/0001-database-sync-claim.md
 
 use std::collections::hash_map::RandomState;
+use std::collections::HashMap;
 use std::hash::{BuildHasher, Hasher};
-use std::sync::{Arc, OnceLock};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{params, Connection, OptionalExtension};
 
+use crate::db::open_rw_db;
 use crate::error::Result;
 
 /// Hard age limit after which any claim may be taken over.
@@ -31,7 +36,19 @@ pub(crate) struct ClaimEnv {
     pub(crate) now: Arc<dyn Fn() -> i64 + Send + Sync>,
     /// Whether a process with this pid is running on this host.
     pub(crate) pid_alive: Arc<dyn Fn(i64) -> bool + Send + Sync>,
+    /// Called with the Source id when a dropped [`ClaimGuard`] has to release its claim in
+    /// the background instead of on the path that ended the claim. Tests count these.
+    pub(crate) on_late_release: Arc<dyn Fn(i64) + Send + Sync>,
+    /// This process's live claim guards: how many per Source id. A claim row with our pid
+    /// and token that no live guard holds is orphaned (its release failed), and this
+    /// process may take it over. Shared by every `ClaimEnv::current()`; tests inject their own.
+    pub(crate) live: LiveGuards,
 }
+
+/// Live [`ClaimGuard`]s of one process, counted per Source id. A count, not a set: one
+/// process may hold guards in two vaults whose Sources share an id, and a count never
+/// under-reports a live guard.
+pub(crate) type LiveGuards = Arc<Mutex<HashMap<i64, usize>>>;
 
 impl std::fmt::Debug for ClaimEnv {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -50,8 +67,16 @@ impl ClaimEnv {
             token: instance_token().to_string(),
             now: Arc::new(unix_now),
             pid_alive: Arc::new(pid_is_running),
+            on_late_release: Arc::new(|_| {}),
+            live: process_live_guards(),
         }
     }
+}
+
+/// The one registry of live guards for this process.
+fn process_live_guards() -> LiveGuards {
+    static LIVE: OnceLock<LiveGuards> = OnceLock::new();
+    Arc::clone(LIVE.get_or_init(LiveGuards::default))
 }
 
 /// A random token generated once per process.
@@ -105,7 +130,13 @@ fn pid_is_running(_pid: i64) -> bool {
 }
 
 /// Try to take the claim on `source_id`. Returns `false` when another live Sync holds it.
+///
+/// On success the claim counts as one live guard of this process until [`release`] runs
+/// or [`ClaimGuard::forget`] is called.
 pub(crate) fn try_acquire(conn: &Connection, source_id: i64, env: &ClaimEnv) -> Result<bool> {
+    // One claim decision at a time in this process: judging our own claim orphaned and
+    // taking it over must not race another task of ours doing the same.
+    let mut live = lock(&env.live);
     let now = (env.now)();
     let inserted = conn.execute(
         "INSERT OR IGNORE INTO sync_claims (source_id, pid, instance_token, claimed_at)
@@ -113,6 +144,7 @@ pub(crate) fn try_acquire(conn: &Connection, source_id: i64, env: &ClaimEnv) -> 
         params![source_id, env.pid, env.token, now],
     )?;
     if inserted == 1 {
+        *live.entry(source_id).or_default() += 1;
         return Ok(true);
     }
 
@@ -129,11 +161,16 @@ pub(crate) fn try_acquire(conn: &Connection, source_id: i64, env: &ClaimEnv) -> 
         return Ok(false);
     };
 
-    let reused_pid = holder_pid == env.pid && holder_token != env.token;
-    let expired = now - claimed_at >= MAX_CLAIM_AGE_SECS;
-    let held_by_us = holder_pid == env.pid && holder_token == env.token;
-    // Our own live claim is never abandoned, however old: another task of ours is running it.
-    let abandoned = !held_by_us && (reused_pid || expired || !(env.pid_alive)(holder_pid));
+    let ours = holder_pid == env.pid && holder_token == env.token;
+    let abandoned = if ours {
+        // Our own claim is abandoned only when no live guard of ours holds it: its release
+        // failed. While a guard lives, another task of ours is running it, however old.
+        !live.contains_key(&source_id)
+    } else {
+        let reused_pid = holder_pid == env.pid;
+        let expired = now - claimed_at >= MAX_CLAIM_AGE_SECS;
+        reused_pid || expired || !(env.pid_alive)(holder_pid)
+    };
     if !abandoned {
         return Ok(false);
     }
@@ -147,22 +184,128 @@ pub(crate) fn try_acquire(conn: &Connection, source_id: i64, env: &ClaimEnv) -> 
         params![source_id, env.pid, env.token, now, holder_pid, holder_token],
     )?;
     if taken == 1 {
-        tracing::warn!(source_id, holder_pid, "took over an abandoned sync claim");
+        *live.entry(source_id).or_default() += 1;
+        if ours {
+            tracing::warn!(
+                source_id,
+                "took over this process's own orphaned sync claim"
+            );
+        } else {
+            tracing::warn!(source_id, holder_pid, "took over an abandoned sync claim");
+        }
         reset_interrupted_sync(conn, source_id)?;
     }
     Ok(taken == 1)
 }
 
-/// Release our claim on `source_id` and reset any Sync status it left unfinished.
-pub(crate) fn release(conn: &Connection, source_id: i64, env: &ClaimEnv) -> Result<()> {
-    let deleted = conn.execute(
-        "DELETE FROM sync_claims WHERE source_id = ?1 AND pid = ?2 AND instance_token = ?3",
-        params![source_id, env.pid, env.token],
-    )?;
-    if deleted == 1 {
-        reset_interrupted_sync(conn, source_id)?;
+fn lock(live: &LiveGuards) -> MutexGuard<'_, HashMap<i64, usize>> {
+    live.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// One live guard of this process on `source_id` is gone.
+fn unregister(env: &ClaimEnv, source_id: i64) {
+    let mut live = lock(&env.live);
+    if let Some(count) = live.get_mut(&source_id) {
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            live.remove(&source_id);
+        }
     }
-    Ok(())
+}
+
+/// A held Sync claim. It is built in the same synchronous code that commits the claim row,
+/// so no await can separate the row from its guard; dropping the guard releases the claim.
+#[derive(Debug)]
+pub(crate) struct ClaimGuard {
+    db_path: PathBuf,
+    env: ClaimEnv,
+    source_id: i64,
+    held: bool,
+}
+
+impl ClaimGuard {
+    /// Take the claim on `source_id`, or `None` when another live Sync holds it.
+    pub(crate) fn acquire(
+        conn: &Connection,
+        db_path: PathBuf,
+        source_id: i64,
+        env: &ClaimEnv,
+    ) -> Result<Option<Self>> {
+        if !try_acquire(conn, source_id, env)? {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            db_path,
+            env: env.clone(),
+            source_id,
+            held: true,
+        }))
+    }
+
+    /// Release the claim now, on `conn`.
+    pub(crate) fn release(mut self, conn: &Connection) -> Result<()> {
+        self.held = false;
+        release(conn, self.source_id, &self.env)
+    }
+
+    /// The claim row is already gone: deleting the Source cascaded it away.
+    pub(crate) fn forget(mut self) {
+        self.held = false;
+        unregister(&self.env, self.source_id);
+    }
+}
+
+impl Drop for ClaimGuard {
+    fn drop(&mut self) {
+        if !self.held {
+            return;
+        }
+        let (db_path, env, id) = (self.db_path.clone(), self.env.clone(), self.source_id);
+        (env.on_late_release)(id);
+        let release = move || {
+            let result = match open_rw_db(&db_path) {
+                Ok(conn) => release(&conn, id, &env),
+                Err(err) => {
+                    // The release ran and failed: the row is now an orphan this process
+                    // may take over.
+                    unregister(&env, id);
+                    Err(err)
+                }
+            };
+            if let Err(err) = result {
+                tracing::warn!(source_id = id, error = %err, "failed to release sync claim");
+            }
+        };
+        // A blocking task queued while the runtime shuts down may never run. The claim row
+        // is then left behind like a crashed process's: the next Sync takes it over once
+        // this pid is gone, or on a pid reused with another instance token (ADR-0001).
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn_blocking(release);
+            }
+            Err(_) => release(),
+        }
+    }
+}
+
+/// Release our claim on `source_id` and reset any Sync status it left unfinished. The claim
+/// stops counting as a live guard of this process either way: if the release failed, its
+/// row is an orphan that [`try_acquire`] in this process takes over.
+pub(crate) fn release(conn: &Connection, source_id: i64, env: &ClaimEnv) -> Result<()> {
+    let released = conn
+        .execute(
+            "DELETE FROM sync_claims WHERE source_id = ?1 AND pid = ?2 AND instance_token = ?3",
+            params![source_id, env.pid, env.token],
+        )
+        .map_err(Into::into)
+        .and_then(|deleted| {
+            if deleted == 1 {
+                reset_interrupted_sync(conn, source_id)?;
+            }
+            Ok(())
+        });
+    unregister(env, source_id);
+    released
 }
 
 /// A Sync that stopped without finishing leaves `sources.status = 'syncing'` and a

@@ -1,0 +1,203 @@
+# fix-sync-lifetime: the Source lifecycle owns a Sync from claim to release
+
+Origin: architecture review 2026-11-28, candidate 02 (rated Strong).
+
+## Findings
+
+### A. Claim-leak window: confirmed
+
+- `SourceLifecycle::claim_record` (`src/sources/mod.rs`, before this task) commits the `sync_claims` row inside `blocking(..)` (`spawn_blocking(..).await`). It builds the `ClaimedSync` guard only after that await returns.
+- A caller dropped during the await abandons the detached blocking task. That task still commits the row, but no guard ever exists to release it.
+- `claim::try_acquire` never treats a row with this process's pid and token as abandoned (`held_by_us`, `src/sources/claim.rs`). The holder cannot claim again either: see `second_claim_is_refused` in `claim_tests.rs`. So this process can never Sync that Source until it restarts, and other processes wait out the 6 h age limit.
+- Red evidence: a test-only probe pauses the claim hop right after the row commits, and the test aborts the caller there. On `main` @ 116f42c:
+  - `claim_caller_dropped_after_claim_commits_does_not_leak` fails: `the abandoned claim is released`, left `1`, right `0`. The row stays.
+  - `sync_caller_dropped_after_claim_commits_neither_cancels_nor_leaks` fails with status `idle`: no Sync ran, and the claim leaked.
+- `ClaimedSync::run` spawned the Sync task only once polled. A caller dropped before that point got no Sync at all; that is B.
+
+### B. Flaky `dropped_sync_future_still_finishes_in_background`: confirmed, the cause is the drop landing before the spawn
+
+- The MCP `manage sync` path reaches `SourceLifecycle::sync` with no await before it. `sync` then made two blocking hops before it spawned the Sync task:
+  1. hop 1 loaded the Source;
+  2. hop 2 took the claim.
+- Each hop re-runs `open_rw_db` and its schema batch. When the 50 ms timeout fired inside either hop, the Sync never started (status `idle`). Under CPU load the hops take longer, so the test failed more often.
+- Deterministic evidence, on `main`:
+  - `sync_caller_dropped_while_loading_still_syncs` pauses hop 1 and drops the caller: status `idle`, no claim row.
+  - The hop-2 variant (finding A) gives `idle` and a leaked row.
+  - Rewritten to poll the MCP request exactly once (`timeout(Duration::ZERO, ..)`), `dropped_sync_future_still_finishes_in_background` fails every run with `idle`.
+
+### C. Sync-run state has five writers in three files: confirmed; the "web vs local diverge" part is changed
+
+The five writers on `main`:
+
+| Writer | Where | Writes |
+|---|---|---|
+| `start_sync_run` | `src/ingest/local.rs:157` | `sources.status='syncing'`, a new `'running'` run |
+| 'ok' close in `persist_sync_outcomes` | `local.rs:~509-536` | run `'ok'` and its counts, `sources.status='ok'`, in the page transaction |
+| `fail_sync_run` | `local.rs:171` (called at `local.rs:218` and `web.rs:417`) | run `'error'`, `sources.status='error'`; errors swallowed with `let _ =` |
+| `record_sync_failure` | `src/sources/mod.rs:471` | closes every `'running'` run, or inserts an error run when none is newer than a `MAX(id)` read taken before the Sync; `sources.status='error'` |
+| `reset_interrupted_sync` | `src/sources/claim.rs:170` | on release or takeover: `'running'` runs and `'syncing'` Sources become `'error'` ("interrupted") |
+
+- The run id never reaches the lifecycle. `sync_record` guesses it from `SELECT COALESCE(MAX(id),0)`, read before the Sync. Confirmed.
+- `web.rs` imports `start_sync_run`, `fail_sync_run` and `persist_sync_outcomes` from `ingest::local`. Confirmed.
+- **Changed:** "a failed web persist skips `fail_sync_run`" is true of the code path but not of the recorded state.
+  - Every failure is recorded twice: once by the driver (`fail_sync_run`) and again by the lifecycle (`record_sync_failure`).
+  - A web persist failure, or a failed `open_rw_db` after the crawl, skips the first write, but `record_sync_failure` still closes the `'running'` run.
+  - Evidence: `failed_page_write_records_one_error_run_for_web_and_local` installs a trigger that aborts every page insert. On `main` it passes for both kinds: one error run carrying the write error, `status='error'`, claim released.
+  - So the defect is duplicated and guessed bookkeeping, not a wrong result.
+
+### `add` returns its first Sync as a value: not fixed (follow-up)
+
+- A failed first Sync turns `add` into `Err` after the Source row has committed, and a retried `add` then fails with "already registered".
+- Returning the first Sync as a value would change the CLI exit status, MCP `isError`, the UI response and SPEC. That is outside this task.
+- Follow-up: make `Added` carry the first Sync's result, and have the CLI, MCP and UI report a registered Source whose first Sync failed.
+
+## Task
+
+Make the Source lifecycle run each Sync as one task, from claim to release:
+
+- A caller holds only a handle. Dropping the handle can neither cancel the Sync nor leak its claim.
+- The lifecycle opens and closes the Sync run exactly once and holds its id.
+- The folder walk and the web crawl become drivers that only return page outcomes.
+- Writing pages moves into one module that both drivers' outcomes flow through.
+
+## Acceptance criteria
+
+1. The claim guard is built in the same synchronous code that commits the `sync_claims` row. A caller dropped at any await point never leaves a row behind: `claim_caller_dropped_after_claim_commits_does_not_leak`.
+2. A dropped `sync` caller neither cancels nor prevents the Sync, at every pause point:
+   - while loading: `sync_caller_dropped_while_loading_still_syncs`;
+   - after the claim: `sync_caller_dropped_after_claim_commits_neither_cancels_nor_leaks`;
+   - during the walk or crawl, and while writing pages: fake-driver tests.
+   - `dropped_sync_future_still_finishes_in_background` polls the MCP request exactly once and passes every run.
+3. The UI keeps 202/409: the claim is known before the reply, and a second request gets 409 while a Sync runs.
+4. One Sync opens exactly one Sync run and closes it exactly once, by id. No `MAX(id)` guess, no `record_sync_failure`.
+5. The 'ok' close and `sources.status='ok'` commit in the same transaction as the page writes.
+6. Every failure after the Sync run is open records one error run, sets `status='error'` and `last_error`, and releases the claim. A failure before that records nothing and releases any claim it took:
+   - Source missing: `NotFound`, no run, no claim;
+   - opening the run fails: no run, status unchanged, claim released (`failure_to_open_the_run_releases_the_claim`).
+
+   Failures after the run is open:
+   - the driver fails;
+   - the driver panics;
+   - writing pages fails.
+   - Both production drivers (local, web) are covered for the page-write failure.
+7. `src/ingest/local.rs` no longer writes `sync_runs`. `web.rs` no longer imports Sync-run or persist code from `local.rs`.
+8. The `web_sync_summary` line still carries `ok` and `write_ms` for the page write (SPEC §4.1 item 4).
+9. The checks gate passes, including the lite clippy.
+
+## Design decisions
+
+### Interface
+
+```rust
+impl SourceLifecycle {
+    pub fn start_sync(&self, name: &str, prune: bool) -> SyncHandle; // spawns now
+    pub(crate) fn start_sync_record(&self, source: SourceRecord, prune: bool) -> SyncHandle;
+    pub async fn sync(&self, name: &str, prune: bool) -> Result<SyncOutcome>; // start + finish
+    pub(crate) async fn claim(&self, name: &str) -> Result<Option<ClaimGuard>>; // remove(), tests
+}
+impl SyncHandle {
+    pub async fn claimed(self) -> Result<Option<RunningSync>>; // None = AlreadySyncing
+    pub async fn finish(self) -> Result<SyncOutcome>;
+}
+impl RunningSync { pub async fn finish(self) -> Result<SyncSummary>; }
+```
+
+- `start_sync` is a plain `fn` that spawns the task at once, so nothing is lost between the call and the first await. `sync` is `start_sync(..).finish()`, so the MCP path spawns on its first poll.
+- The task runs every step itself and reports through a oneshot whether it took the claim; it never waits on its caller:
+  1. one blocking hop that loads the Source, takes the claim (building the guard) and opens the Sync run;
+  2. the driver;
+  3. one blocking hop that writes pages and closes the run, then releases the claim.
+- The typestate `SyncHandle` → `RunningSync` gives the UI and scheduler the claim result before the Sync ends, without a second error copy.
+- `ClaimGuard` (`src/sources/claim.rs`) replaces `ClaimedSync`'s Drop. If the Sync task panics, the guard's Drop releases the claim, and `reset_interrupted_sync` closes the run.
+- `SyncRun` (`src/sources/sync_run.rs`) is the only writer of a Sync run besides crash recovery:
+  - `open` marks the Source `'syncing'` and inserts the `'running'` row;
+  - `succeed(&Transaction, &SyncSummary)` closes the run inside the page transaction;
+  - `fail` closes it and returns errors instead of swallowing them.
+  - `reset_interrupted_sync` stays in `claim.rs` as crash and takeover recovery.
+- Driver seam (`SyncDriver`, a boxed-future method, no `async-trait` crate):
+  - The production adapter dispatches on `SourceKind` to `local::collect` (on the blocking pool) and `web::collect`.
+  - It runs the Private-origin check (`origin.rs`) before every web Sync.
+  - The test adapter `FakeDriver` makes the seam real.
+- Persist module `src/ingest/persist.rs` holds `SyncPages` (outcomes, missing-page policy, warnings, and an `on_written` report hook), `PageIngestOutcome`, `MissingPagePolicy`, `SyncSummary`, and `write_pages(&Transaction, ..)`.
+- The web driver hands back an `on_written(ok, duration)` hook. The lifecycle calls it after the write, so the `web_sync_summary` line still has `ok` and `write_ms` without the lifecycle knowing about web accounting.
+
+### Alternatives rejected
+
+- **Spawn the task inside `ClaimedSync::run` only, with the guard still built after the hop.** This fixes B for MCP but leaves A open for `claim()`/`remove()` and for any caller dropped during the claim hop.
+- **Keep the claim in a hop the caller awaits, and catch the drop with a `Drop` impl on the future.** A future cannot learn whether a detached blocking task committed, so this stays racy.
+- **The lifecycle logs `web_sync_summary` itself.** That puts web accounting into `src/sources/`; the `on_written` hook keeps it in `web.rs`.
+- **A separate transaction for the 'ok' close.** This regresses crash consistency: pages could commit while the run stays `'running'`.
+- **The `async-trait` crate for the driver seam.** It adds a dependency for one method.
+
+## Review fixes
+
+The independent review ran `/code-review` at medium effort on `116f42c..3843e91`. Red output is in the HumanAudit report.
+
+1. **`finish()` lost the driver's error when it could not open the vault: fixed in 0618cf7.**
+   - The driver's error now wins.
+   - `on_written(false, ..)` always runs. A `WriteReport` guard also reports a panic while writing.
+   - `finish()` retries once on a fresh connection to close the run and release the claim before returning.
+   - Red, then green:
+     - `database_open_failure_after_the_driver_keeps_its_error_and_closes_the_run`: red with the error "unable to open database file", which replaced "crawl broke".
+     - `database_open_failure_before_the_write_reports_it_and_closes_the_run`: red, `written()` was `[]`.
+   - The test probe makes the first open fail (`Stage::Finishing` chmods `vault.db` to 000) and the retry succeed (`Stage::Recording`).
+   - If the retry fails too, nothing can be recorded. The error is logged, and the dropped guard falls back to its background release.
+2. **A failed `remove`, or a failure to open the run, released the claim only in the background: fixed in 0618cf7.**
+   - Both now release on the hop's connection before returning.
+   - `ClaimEnv::on_late_release` counts background releases, so the tests are deterministic.
+   - Red, then green:
+     - `failed_remove_releases_the_claim_before_returning`: late releases were 1.
+     - `failure_to_open_the_run_releases_the_claim`: late releases were 1. It no longer polls.
+3. **Version still 0.4.1: deferred by design.** The bump and the tag happen once, at merge time.
+4. **A claim release during runtime shutdown may not run: pre-existing, documented in 0618cf7.**
+   - `ClaimGuard::drop` now says the row is left like a crashed process's, and that ADR-0001's takeover rules (dead pid, reused pid with another token, 6 h) recover it.
+   - Follow-up: release synchronously when the runtime is shutting down.
+5. **`sync_all` swallowed a NotFound from any stage: fixed in aef90b9.**
+   - Only a NotFound before the claim is skipped.
+   - Red, then green: `sync_all_reports_a_drivers_not_found_instead_of_skipping_the_source` (red: 0 results).
+6. **SPEC said every failed Sync records a run: fixed in the docs commit.** It now says "once its Sync run is open", and that a failure before that releases the claim first.
+7. **No test checked `write_ms` after `on_written`: fixed in the `test(web)` commit.**
+   - `summary_line_after_the_write_carries_ok_and_write_ms` captures the logged line.
+   - It was shown to fail (`write_ms=-`) with the `write_ms` assignment removed.
+
+Still deferred: "`add` returns its first Sync as a value" (see Findings).
+
+## Second review
+
+The second review ran `/code-review` at medium effort with `--fix` on `116f42c..bd68aa4`. It found no blocking bug.
+
+1. **`begin` created an empty vault for a loaded Source when `vault.db` was gone (nit, `src/sources/sync.rs`): applied.**
+   - Only the `Target::Name` branch checked that the file exists. The `Target::Record` branch (`sync_all`, the scheduler, `add`) called `open_rw_db`, which creates a fresh database.
+   - `begin` now checks before the match, for both targets, and returns `NotFound`.
+   - Red, then green: `sync_of_a_loaded_source_after_the_vault_is_gone_does_not_create_it` (red: "the Sync recreated an empty vault").
+2. **A failed claim release leaves the Source `AlreadySyncing` until the process restarts (pre-existing, `src/sources/claim.rs` `ClaimGuard::release`): deferred.**
+   - `try_acquire` never takes back a row with this process's pid and token, and `finish`/`remove` only log a failed release.
+   - Follow-up: let this process take back a claim no in-memory guard holds, or retry the release. This needs an ADR-0001 decision.
+3. **A failed `run.fail` loses the Sync's real error (nit, `src/sources/sync.rs` `finish`): deferred.**
+   - The release that follows closes the run with the generic "interrupted" message. The real error only reaches the log. This is safe; a retry on a fresh connection is optional.
+4. **No `web_sync_summary` line when the final hop never runs (nit, runtime shutdown after a crawl): deferred.**
+   - `SyncPages::on_written` has no Drop fallback. Adding one needs `write_pages` to stop destructuring `SyncPages`.
+5. **Version still 0.4.1 (nit): deferred by design.** The bump and the tag happen once, at merge time.
+
+## User decisions
+
+**A failed `ClaimGuard::release` left the Source AlreadySyncing until restart.** This was deferred in the second review. The user chose an in-process registry of live guards (b46302c).
+
+- **The registry.** `ClaimEnv::live` (`LiveGuards`) counts live guards per Source id.
+  - Every `ClaimEnv::current()` shares one registry; tests inject their own.
+  - It is a count, not a set, because one process can hold guards in two vaults whose Sources share an id. A count never under-reports a live guard.
+  - `try_acquire` registers each claim it takes. `release`, `forget` and a dropped guard unregister once the release has really run, even when it failed.
+- **Orphans.** `try_acquire` treats a claim with our pid and token as orphaned when no live guard holds it.
+  - It takes the claim over through the same guarded `UPDATE` and logs "took over this process's own orphaned sync claim".
+  - The registry lock spans the whole claim decision, so two tasks of this process cannot both take one orphan over.
+- **Exclusion stays in `sync_claims`.** Other processes' claims are judged exactly as before.
+- **Docs.** ADR-0001 gains one Consequences bullet, and the SPEC module-layout line for `claim.rs` mentions the takeover.
+- **Red, then green:**
+  - `claim::tests::failed_release_leaves_an_orphan_its_own_process_takes_over`
+  - `claim::tests::only_one_task_takes_over_an_orphan` (red: 0 winners; now exactly 1 of 8 threads)
+  - `sources::tests::sync_takes_over_its_own_claim_whose_release_failed` (red: AlreadySyncing)
+- **Guards against regressions** (green before and after):
+  - `claim::tests::claim_with_a_live_guard_is_never_taken_over_by_its_own_process`
+  - `sources::tests::sync_never_takes_over_a_claim_whose_guard_is_alive`
+  - `claim::tests::own_claim_never_expires_for_its_holder`
+- **Residual risk.** The registry knows Source ids, not vaults. A live guard in another vault with the same id can delay an orphan takeover in this one. That only ever refuses a takeover; it never allows two guards.

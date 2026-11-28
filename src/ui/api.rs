@@ -247,17 +247,18 @@ pub async fn sync_source(
 ) -> ApiResult<(StatusCode, Json<SyncAcceptedResponse>)> {
     let (source_id, source_name) = resolve_source_in_vault(&state.config, &id_or_slug)?;
 
-    // Claim before replying, so a second request gets 409 instead of a silent no-op.
-    let Some(claimed) = SourceLifecycle::new(state.config.clone())
-        .claim(&source_name)
+    // Wait for the claim before replying, so a second request gets 409 instead of a silent
+    // no-op. The Sync runs as its own task: a client that disconnects does not stop it.
+    let Some(running) = SourceLifecycle::new(state.config.clone())
+        .start_sync(&source_name, query.prune)
+        .claimed()
         .await?
     else {
         return Err(already_syncing(&source_name));
     };
     let name_for_task = source_name.clone();
-    let prune = query.prune;
     tokio::spawn(async move {
-        if let Err(err) = claimed.run(prune).await {
+        if let Err(err) = running.finish().await {
             tracing::error!(
                 source = %name_for_task,
                 error = %err,
