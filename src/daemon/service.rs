@@ -122,6 +122,10 @@ impl ServiceManager for NoServiceManager {
         self.0.clone()
     }
 
+    fn file_data_dir(&self) -> Option<PathBuf> {
+        None
+    }
+
     fn start(&self) -> Result<()> {
         Err(VaultError::Other(format!(
             "no OS service manager to start the daemon: {:?}",
@@ -132,6 +136,14 @@ impl ServiceManager for NoServiceManager {
     fn stop(&self) -> Result<()> {
         Ok(())
     }
+}
+
+/// The `CITADEL_HOME` a service file names; `None` when it is missing or unreadable.
+fn file_data_dir(
+    path: &Path,
+    parse: fn(&str) -> (Option<PathBuf>, Option<PathBuf>),
+) -> Option<PathBuf> {
+    parse(&std::fs::read_to_string(path).ok()?).1
 }
 
 /// Read a service file and parse `(binary, CITADEL_HOME)` from it.
@@ -202,6 +214,10 @@ impl ServiceManager for Launchd {
         inspect_file(&self.plist, parse_launchd_plist, Self::loaded)
     }
 
+    fn file_data_dir(&self) -> Option<PathBuf> {
+        file_data_dir(&self.plist, parse_launchd_plist)
+    }
+
     fn start(&self) -> Result<()> {
         self.reload()
     }
@@ -239,6 +255,10 @@ impl Systemd {
 impl ServiceManager for Systemd {
     fn inspect(&self) -> ServiceState {
         inspect_file(&self.unit, parse_systemd_unit, Self::loaded)
+    }
+
+    fn file_data_dir(&self) -> Option<PathBuf> {
+        file_data_dir(&self.unit, parse_systemd_unit)
     }
 
     fn start(&self) -> Result<()> {
@@ -651,6 +671,10 @@ mod tests {
         };
         assert!(loaded);
         assert_eq!(file.data_dir.as_deref(), Some(dir.path()));
+        assert_eq!(
+            file_data_dir(&missing, parse_launchd_plist).as_deref(),
+            Some(dir.path())
+        );
     }
 
     #[test]

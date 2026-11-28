@@ -6,7 +6,7 @@
 //! through the real `daemon.pid`.
 
 use std::fs::{self, OpenOptions};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -57,6 +57,8 @@ pub enum ServiceState {
 pub trait ServiceManager {
     /// Read the service file and ask the manager whether it has the job. Read-only.
     fn inspect(&self) -> ServiceState;
+    /// The data dir (`CITADEL_HOME`) the installed service file names. Reads only the file.
+    fn file_data_dir(&self) -> Option<PathBuf>;
     /// Start the service so it runs the binary now on disk, even one replaced since the job
     /// was loaded.
     fn start(&self) -> Result<()>;
@@ -113,19 +115,6 @@ pub enum Restart {
     StatusUnknown(VaultError),
 }
 
-/// Whether `state` is the service of the vault at `data_dir`: its file names that data dir.
-/// Whether the manager has it loaded right now does not matter: starting it loads it.
-fn service_supervises(state: &ServiceState, data_dir: &Path) -> bool {
-    matches!(
-        state,
-        ServiceState::Installed { file, .. }
-            if file
-                .data_dir
-                .as_deref()
-                .is_some_and(|dir| crate::fsutil::same_path(dir, data_dir))
-    )
-}
-
 /// Daemon supervision for one vault.
 pub struct Supervision {
     config: VaultConfig,
@@ -169,9 +158,12 @@ impl Supervision {
         self.manager.inspect()
     }
 
-    /// Whether this vault's OS service runs the daemon.
+    /// Whether this vault's OS service runs the daemon: the installed service file names this
+    /// vault. Whether the manager runs it right now does not matter: starting it does.
     pub fn supervised(&self) -> bool {
-        service_supervises(&self.manager.inspect(), &self.config.data_dir)
+        self.manager
+            .file_data_dir()
+            .is_some_and(|dir| crate::fsutil::same_path(&dir, &self.config.data_dir))
     }
 
     /// Start the daemon: through this vault's service when one is installed, else detached.
@@ -222,7 +214,12 @@ impl Supervision {
         if !supervised {
             return self.process.spawn().map(Started::Spawned);
         }
-        self.manager.start()?;
+        self.manager.start().map_err(|err| {
+            VaultError::Other(format!(
+                "could not start the daemon through its OS service: {err}. To run it without \
+                 the service, use `citadel daemon start --foreground`"
+            ))
+        })?;
         let deadline = Instant::now() + self.start_timeout;
         loop {
             // 0: the daemon took the lock but has not written its pid yet.
@@ -465,6 +462,8 @@ mod tests {
         killed_mid_sync: bool,
         /// The job cannot be loaded (`bootstrap` keeps failing).
         job_broken: bool,
+        /// `inspect` calls (each asks the manager, a subprocess in production).
+        inspections: u32,
         /// Stopping the service fails (systemd: no user bus).
         stop_fails: bool,
         spawns: u32,
@@ -558,7 +557,9 @@ mod tests {
 
     impl ServiceManager for Fake {
         fn inspect(&self) -> ServiceState {
-            match &self.world().service {
+            let mut w = self.world();
+            w.inspections += 1;
+            match &w.service {
                 None => ServiceState::NotInstalled,
                 Some(s) => ServiceState::Installed {
                     file: ServiceFile {
@@ -570,6 +571,10 @@ mod tests {
                     loaded: s.loaded,
                 },
             }
+        }
+
+        fn file_data_dir(&self) -> Option<PathBuf> {
+            self.world().service.as_ref()?.data_dir.clone()
         }
 
         fn start(&self) -> Result<()> {
@@ -655,6 +660,7 @@ mod tests {
                 relaunch_delay: Duration::ZERO,
                 killed_mid_sync: false,
                 job_broken: false,
+                inspections: 0,
                 stop_fails: false,
                 spawns: 0,
                 service_starts: 0,
@@ -796,6 +802,31 @@ mod tests {
             assert_eq!(started, Started::Spawned(pid));
             assert_eq!(rig.world().service_starts, 0);
         }
+    }
+
+    #[test]
+    fn deciding_supervision_does_not_ask_the_manager() {
+        // Only the service file decides; `launchctl list`/`systemctl is-active` are for doctor.
+        let rig = Rig::new().with_this_vaults_service();
+        assert!(rig.supervision().supervised());
+        assert_eq!(rig.world().inspections, 0);
+    }
+
+    #[test]
+    fn start_names_the_foreground_escape_when_the_service_cannot_start() {
+        // No reachable manager (no user bus, no `gui/<uid>` domain over SSH): spawning beside
+        // the service is not an option, running in the foreground is.
+        let rig = Rig::new().with_this_vaults_service();
+        rig.world().daemon = None;
+        let _ = fs::remove_file(rig.config.pid_path());
+        rig.world().job_broken = true;
+        let err = rig.supervision().start().expect_err("service cannot start");
+        assert!(
+            err.to_string()
+                .contains("citadel daemon start --foreground"),
+            "{err}"
+        );
+        assert_eq!(rig.world().spawns, 0);
     }
 
     #[test]

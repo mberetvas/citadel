@@ -490,8 +490,8 @@ fn report_restart<W: Write>(out: &mut W, restart: Restart) -> Result<()> {
             error,
         } => writeln!(
             out,
-            "Warning: could not restart the daemon through its OS service: {error}. Run \
-             `citadel doctor`; `citadel daemon install` re-registers the service."
+            "Warning: could not restart the daemon: {error}. Run `citadel doctor`; \
+             `citadel daemon install` re-registers the service."
         )?,
         Restart::StartFailed {
             supervised: false,
