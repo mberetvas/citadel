@@ -109,6 +109,7 @@ src/
     sync_run.rs      # `SyncRun`: opened once after the claim, closed once (ok in the page
                      # transaction, or error)
     claim.rs         # Sync claims (ADR-0001); `ClaimGuard` is built in the hop that commits the row
+                     # a claim of ours with no live guard (failed release) is taken over
     driver.rs        # `SyncDriver` seam: folder walk or web crawl, returning page outcomes only
     origin.rs        # Origin classification + the Private-origin rule
   ingest/

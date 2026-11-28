@@ -178,3 +178,26 @@ The second review ran `/code-review` at medium effort with `--fix` on `116f42c..
 4. **No `web_sync_summary` line when the final hop never runs (nit, runtime shutdown after a crawl): deferred.**
    - `SyncPages::on_written` has no Drop fallback. Adding one needs `write_pages` to stop destructuring `SyncPages`.
 5. **Version still 0.4.1 (nit): deferred by design.** The bump and the tag happen once, at merge time.
+
+## User decisions
+
+**A failed `ClaimGuard::release` left the Source AlreadySyncing until restart.** This was deferred in the second review. The user chose an in-process registry of live guards (b46302c).
+
+- **The registry.** `ClaimEnv::live` (`LiveGuards`) counts live guards per Source id.
+  - Every `ClaimEnv::current()` shares one registry; tests inject their own.
+  - It is a count, not a set, because one process can hold guards in two vaults whose Sources share an id. A count never under-reports a live guard.
+  - `try_acquire` registers each claim it takes. `release`, `forget` and a dropped guard unregister once the release has really run, even when it failed.
+- **Orphans.** `try_acquire` treats a claim with our pid and token as orphaned when no live guard holds it.
+  - It takes the claim over through the same guarded `UPDATE` and logs "took over this process's own orphaned sync claim".
+  - The registry lock spans the whole claim decision, so two tasks of this process cannot both take one orphan over.
+- **Exclusion stays in `sync_claims`.** Other processes' claims are judged exactly as before.
+- **Docs.** ADR-0001 gains one Consequences bullet, and the SPEC module-layout line for `claim.rs` mentions the takeover.
+- **Red, then green:**
+  - `claim::tests::failed_release_leaves_an_orphan_its_own_process_takes_over`
+  - `claim::tests::only_one_task_takes_over_an_orphan` (red: 0 winners; now exactly 1 of 8 threads)
+  - `sources::tests::sync_takes_over_its_own_claim_whose_release_failed` (red: AlreadySyncing)
+- **Guards against regressions** (green before and after):
+  - `claim::tests::claim_with_a_live_guard_is_never_taken_over_by_its_own_process`
+  - `sources::tests::sync_never_takes_over_a_claim_whose_guard_is_alive`
+  - `claim::tests::own_claim_never_expires_for_its_holder`
+- **Residual risk.** The registry knows Source ids, not vaults. A live guard in another vault with the same id can delay an orphan takeover in this one. That only ever refuses a takeover; it never allows two guards.
