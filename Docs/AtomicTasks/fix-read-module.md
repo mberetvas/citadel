@@ -182,3 +182,24 @@ No hunk touches lines 128-246.
   - MCP `query` still creates the vault on a missing path (`mcp/mod.rs:196`, outside this region). The four `exists()` checks in `sources/mod.rs` follow the same rule, but they are not yet routed through the module.
   - `spawn_blocking` for UI reads is verified by code review only. `oneshot` tests cannot observe a blocked worker.
   - `loadRecentChanges` (fixed `v_recent_changes` SQL) and the SQL Explorer presets still use `/api/query`. They are not Page-list reads.
+
+## Review fixes
+
+Source: an independent `/code-review` of `116f42c..8804b47` (claude-opus-5-5, high effort). Each finding is listed below with its commit and its red-then-green test.
+
+| # | Finding | Outcome | Commit | Red → green evidence |
+|---|---|---|---|---|
+| 1 | Search ran one FTS5 MATCH per Page (the `LEFT JOIN` subquery was flattened); no timeout | **Fixed.** A `MATERIALIZED` CTE runs the MATCH once. Every read view now goes through `read_vault`, which stops a read after 5 s with `QueryTimeout` (the `db::readonly` default and mechanism; 408 in the UI) | `8af8241`, `9f79cfc` | `ingest::read::tests::search_runs_the_fts_match_once_not_per_page` checks `EXPLAIN QUERY PLAN`; it was red with `SCAN pages_fts VIRTUAL TABLE INDEX 0:=M2 LEFT-JOIN` and is now green. `ingest::read::tests::reads_past_the_deadline_time_out` takes the deadline as a parameter (`Duration::ZERO`), so it doesn't depend on the clock; it was red (the read returned 502 rows) and is now `QueryTimeout`. Live check on 10k Pages (debug build): `q=a*` 0.22 s, `q=guide` 0.02 s (the review measured 267 s and 3.18 s) |
+| 2 | Version still 0.4.1 | **Skipped, as instructed.** The bump and the tag happen once, at merge time | — | — |
+| 3 | One out-of-range stored limit broke every Source read and blocked deleting the bad Source | **Fixed: tolerate.** A value outside `u32` is logged at `warn` (Source id, column, stored value) and read as the default (500 / 5), which was the behaviour before this branch, now with a log line. *Rejected:* surfacing an error per Source, because every caller would need a new error-carrying row type, and a hand-edited value doesn't justify that. Acceptance criterion 5 is changed accordingly. Error tagging: the remaining conversion errors are all on TEXT columns, so `Type::Text` is now correct | `b9e30a3` | `ingest::read::tests::out_of_range_stored_limit_does_not_break_other_reads` replaces `out_of_range_stored_limits_are_read_errors`. It was red (`find_source` failed on `max_pages -1`) and is now green: lookup, `list_sources`, `all_sources` and `due_web_sources` all succeed |
+| 4 | `?source=` trimmed for the blank check but not for the lookup | **Fixed** | `2d36bc4` | `ui::tests::all_sources_page_list_has_http_status_and_a_marked_cap` (`?source=beta%20` returns 200); red, then green |
+| 5 | Bind list duplicated in `query_pages` | **Fixed.** One `Vec<&dyn ToSql>`, extended for search and limit | `8af8241` | Covered by the existing search and filter tests |
+| 6 | Watcher order changed from id to name | **Fixed.** `sort_by_key(id)` after `retain` | `893c2c5` | Cleanup, so no new test; `daemon::` tests pass (18) |
+| 7 | *Pre-existing:* out-of-order Browser responses | **Fixed** (small, and inside my region). A `browserSearchSeq` counter drops a superseded response and a superseded error | `2d36bc4` | `ui::tests::ui_assets_read_page_lists_from_the_server` asserts the guard; red, then green. There is no JS behaviour test harness, so this is checked at asset level only |
+| — | All-sources list has no row cap (coordinator note; the review acknowledged it as a design decision) | **Fixed.** Both page-list endpoints take `?limit=` (1–10000, default 1000, otherwise 400). The server reads `limit + 1` rows, returns `limit`, and sets `X-Citadel-Truncated: true` when the list was cut. The Browser and Health counts show `1000+`. The response stays a plain array | `2d36bc4` | `ui::tests::all_sources_page_list_has_http_status_and_a_marked_cap` (limit 50 is truncated, an exact fit is not, 0 and 10001 return 400) and `ingest::read::tests::limits_a_page_list_in_list_order`; red, then green. Live check: 10k Pages give 1000 rows plus the header, and the Browser shows `1000+` (screenshot) |
+
+**Deferred:**
+- *Partial-word search* (the review suggested an automatic `*` on the last word). This is a visible behaviour change and the review left it open, so it is recorded as a follow-up, not built.
+- *Health list order under the cap.* The server orders by URI, and the client re-sorts by `last_checked_at`. A list cut at 1000 can therefore miss the newest checks. That needs more than 1000 Stale/Error pages, and the count shows `1000+` when it happens. Follow-up: a server-side `order=last_checked` option.
+
+**Gate after the fixes:** see the next section.
