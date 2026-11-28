@@ -6,7 +6,7 @@
 
 use std::time::Duration;
 
-use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Row};
+use rusqlite::{params_from_iter, Connection, OpenFlags, OptionalExtension, Row, ToSql};
 use serde::{Deserialize, Serialize};
 
 use super::{SourceDetail, SourceKind, SourceRecord, SourceSummary, SyncRunRecord};
@@ -117,49 +117,44 @@ pub fn list_pages(config: &VaultConfig, query: &PageQuery) -> Result<Vec<PageLis
 
 fn query_pages(conn: &Connection, query: &PageQuery) -> Result<Vec<PageListItem>> {
     let st = query.statuses;
-    let filter = params![query.source_id, st.is_any(), st.active, st.stale, st.error];
+    let any = st.is_any();
     let term = query
         .search
         .as_deref()
         .map(str::trim)
         .filter(|t| !t.is_empty());
-    let rows = match term {
-        None => {
-            let sql = format!("{PAGE_LIST_SELECT} WHERE {PAGE_LIST_FILTER} ORDER BY p.uri ASC");
-            let mut stmt = conn.prepare(&sql)?;
-            let rows = stmt
-                .query_map(filter, map_page_list_item)?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            rows
-        }
-        Some(term) => {
-            let sql = format!(
-                "{PAGE_LIST_SELECT}
-                 LEFT JOIN (SELECT rowid AS page_id, bm25(pages_fts) AS rank
-                            FROM pages_fts WHERE pages_fts MATCH ?6) m ON m.page_id = p.id
-                 WHERE {PAGE_LIST_FILTER}
-                   AND (m.page_id IS NOT NULL OR p.uri LIKE ?7 ESCAPE '\\')
-                 ORDER BY m.rank IS NULL, m.rank, p.uri ASC"
-            );
-            let mut stmt = conn.prepare(&sql)?;
-            let rows = stmt
-                .query_map(
-                    params![
-                        query.source_id,
-                        st.is_any(),
-                        st.active,
-                        st.stale,
-                        st.error,
-                        fts_phrases(term),
-                        like_substring(term)
-                    ],
-                    map_page_list_item,
-                )?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            rows
-        }
-    };
+    let search = term.map(|t| (fts_phrases(t), like_substring(t)));
+    let mut binds: Vec<&dyn ToSql> = vec![&query.source_id, &any, &st.active, &st.stale, &st.error];
+    if let Some((phrases, pattern)) = &search {
+        binds.push(phrases);
+        binds.push(pattern);
+    }
+    let mut stmt = conn.prepare(&page_list_sql(search.is_some()))?;
+    let rows = stmt
+        .query_map(params_from_iter(binds), map_page_list_item)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
+}
+
+/// The Page list SQL. Binds: `?1` source id, `?2..?5` status flags, and with a
+/// search, `?6` the FTS5 phrases and `?7` the URI `LIKE` pattern.
+fn page_list_sql(with_search: bool) -> String {
+    if !with_search {
+        return format!("{PAGE_LIST_SELECT} WHERE {PAGE_LIST_FILTER} ORDER BY p.uri ASC");
+    }
+    // MATERIALIZED runs the MATCH once; flattened into the join, SQLite would run one
+    // FTS lookup per Page row (a short prefix took minutes on 10k Pages).
+    format!(
+        "WITH m AS MATERIALIZED (
+             SELECT rowid AS page_id, bm25(pages_fts) AS rank
+             FROM pages_fts WHERE pages_fts MATCH ?6
+         )
+         {PAGE_LIST_SELECT}
+         LEFT JOIN m ON m.page_id = p.id
+         WHERE {PAGE_LIST_FILTER}
+           AND (m.page_id IS NOT NULL OR p.uri LIKE ?7 ESCAPE '\\')
+         ORDER BY m.rank IS NULL, m.rank, p.uri ASC"
+    )
 }
 
 /// Quote each word as an FTS5 phrase, so no user input is parsed as FTS5 syntax.
@@ -605,6 +600,39 @@ mod tests {
         assert_eq!(
             uris(&found),
             vec!["https://alpha.example.com/api/v2/missing"]
+        );
+    }
+
+    #[test]
+    fn search_runs_the_fts_match_once_not_per_page() {
+        let (_dir, config) = seeded_vault();
+        let conn = open_vault_for_read(&config)
+            .expect("open")
+            .expect("vault exists");
+        let plan: Vec<String> = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {}", page_list_sql(true)))
+            .expect("prepare plan")
+            .query_map(
+                rusqlite::params![
+                    None::<i64>,
+                    true,
+                    false,
+                    false,
+                    false,
+                    "\"guide\"",
+                    "%guide%"
+                ],
+                |row| row.get::<_, String>("detail"),
+            )
+            .expect("query plan")
+            .collect::<rusqlite::Result<_>>()
+            .expect("plan rows");
+        // A pages_fts lookup inside the join loop means one MATCH per Page row.
+        assert!(
+            !plan
+                .iter()
+                .any(|line| line.contains("pages_fts") && line.contains("LEFT-JOIN")),
+            "MATCH is evaluated per Page row: {plan:#?}"
         );
     }
 
