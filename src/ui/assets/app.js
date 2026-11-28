@@ -38,6 +38,7 @@
     selectedChangePageId: null,
     sqlHasRun: false,
     addSourceKind: "web",
+    browserSearchSeq: 0,
   };
 
   function el(id) {
@@ -116,7 +117,21 @@
         `Request failed (${resp.status} ${resp.statusText})`;
       throw new Error(msg);
     }
-    return payload;
+    return options.withHeaders ? { payload, headers: resp.headers } : payload;
+  }
+
+  // GET a Page list. The server cuts a list at its limit (default 1000) and says so
+  // in a header, so the count can read "1000+" instead of looking complete.
+  async function fetchPageList(path) {
+    const { payload, headers } = await apiRequest(path, { withHeaders: true });
+    return {
+      pages: Array.isArray(payload) ? payload : [],
+      truncated: headers.get("X-Citadel-Truncated") === "true",
+    };
+  }
+
+  function formatPageCount(list) {
+    return list.truncated ? `${list.pages.length}+` : String(list.pages.length);
   }
 
   // Theme management (supports automatic prefers-color-scheme + persisted override)
@@ -769,84 +784,26 @@
     await searchBrowserPages();
   }
 
-  function escapeSqlLiteral(raw) {
-    return String(raw).replace(/'/g, "''");
-  }
-
-  async function queryAllSourcePages(status, q) {
-    const whereClauses = [];
-    if (status) {
-      whereClauses.push(`p.status = '${escapeSqlLiteral(status)}'`);
-    }
-    if (q) {
-      const safeTerm = escapeSqlLiteral(q);
-      const ftsSql = `SELECT p.id, p.source_id, p.uri, p.title, p.word_count, p.status, p.last_changed_at
-        FROM pages p
-        JOIN pages_fts ON pages_fts.rowid = p.id
-        WHERE pages_fts MATCH '${safeTerm}'${whereClauses.length ? " AND " + whereClauses.join(" AND ") : ""}
-        ORDER BY bm25(pages_fts), p.uri ASC
-        LIMIT 100`;
-      try {
-        const res = await apiRequest("/api/query", {
-          method: "POST",
-          body: { sql: ftsSql, limit: 100 },
-        });
-        return mapQueryRowsToPages(res);
-      } catch {
-        const likePattern = `%${safeTerm}%`;
-        whereClauses.push(
-          `(p.title LIKE '${likePattern}' OR p.uri LIKE '${likePattern}' OR p.content_md LIKE '${likePattern}')`
-        );
-      }
-    }
-
-    const whereSql = whereClauses.length ? `WHERE ${whereClauses.join(" AND ")}` : "";
-    const plainSql = `SELECT p.id, p.source_id, p.uri, p.title, p.word_count, p.status, p.last_changed_at
-      FROM pages p
-      ${whereSql}
-      ORDER BY p.uri ASC
-      LIMIT 100`;
-    const res = await apiRequest("/api/query", {
-      method: "POST",
-      body: { sql: plainSql, limit: 100 },
-    });
-    return mapQueryRowsToPages(res);
-  }
-
-  function mapQueryRowsToPages(queryRes) {
-    if (!queryRes || !Array.isArray(queryRes.rows)) return [];
-    return queryRes.rows.map((row) => ({
-      id: row[0],
-      source_id: row[1],
-      uri: row[2],
-      title: row[3],
-      word_count: row[4],
-      status: row[5],
-      last_changed_at: row[6],
-    }));
-  }
-
   async function searchBrowserPages() {
     const sourceId = el("browser-source-select").value;
     const status = el("browser-status-select").value;
     const q = el("browser-search-input").value.trim();
     const listEl = el("browser-page-list");
     const countEl = el("browser-page-count");
+    // Only the latest search may render: a slower, superseded response is dropped.
+    const seq = ++state.browserSearchSeq;
 
     try {
-      let pages;
-      if (sourceId) {
-        const params = new URLSearchParams();
-        if (status) params.set("status", status);
-        if (q) params.set("q", q);
-        const qs = params.toString();
-        pages = await apiRequest(`/api/sources/${sourceId}/pages${qs ? `?${qs}` : ""}`);
-      } else {
-        pages = await queryAllSourcePages(status, q);
-      }
+      const params = new URLSearchParams();
+      if (sourceId) params.set("source", sourceId);
+      if (status) params.set("status", status);
+      if (q) params.set("q", q);
+      const qs = params.toString();
+      const list = await fetchPageList(`/api/pages${qs ? `?${qs}` : ""}`);
+      if (seq !== state.browserSearchSeq) return;
 
-      state.browserPages = Array.isArray(pages) ? pages : [];
-      countEl.textContent = String(state.browserPages.length);
+      state.browserPages = list.pages;
+      countEl.textContent = formatPageCount(list);
       renderBrowserPageList();
 
       if (state.browserPages.length) {
@@ -859,6 +816,7 @@
           '<div class="empty-state">No pages matched the current filter.</div>';
       }
     } catch (err) {
+      if (seq !== state.browserSearchSeq) return;
       listEl.innerHTML = `<div class="empty-state">Failed to load pages: ${escapeHtml(err.message)}</div>`;
     }
   }
@@ -903,13 +861,14 @@
     }
   }
 
+  // An Error page is one whose `pages.status` is "error", the same rule as the
+  // server's counts and status filter.
   function renderPageStatusBanner(page) {
     const status = String(page.status || "").toLowerCase();
     const errMsg = typeof page.error_message === "string" ? page.error_message.trim() : "";
     const hasHttp = page.http_status !== null && page.http_status !== undefined;
-    const hasFailingHttp = hasHttp && Number(page.http_status) >= 400;
 
-    if (status === "error" || errMsg || hasFailingHttp) {
+    if (status === "error") {
       const parts = [];
       const httpPrefix = hasHttp ? `HTTP ${page.http_status}` : "";
       if (httpPrefix && !errMsg.startsWith(httpPrefix)) parts.push(httpPrefix);
@@ -1084,15 +1043,10 @@
     const tbody = el("health-tbody");
     const countEl = el("health-count");
     try {
-      const res = await apiRequest("/api/query", {
-        method: "POST",
-        body: {
-          sql: "SELECT p.id, s.name AS source_name, p.uri, p.status, p.http_status, p.error_message, p.last_checked_at FROM pages p JOIN sources s ON s.id = p.source_id WHERE p.status IN ('stale', 'error') ORDER BY p.last_checked_at DESC LIMIT 100",
-          limit: 100,
-        },
-      });
-      const rows = res && Array.isArray(res.rows) ? res.rows : [];
-      countEl.textContent = String(rows.length);
+      // The server orders before it cuts, so a cut list keeps the newest checks.
+      const list = await fetchPageList("/api/pages?status=stale,error&order=checked");
+      const rows = list.pages;
+      countEl.textContent = formatPageCount(list);
 
       if (!rows.length) {
         tbody.innerHTML =
@@ -1101,17 +1055,20 @@
       }
 
       tbody.innerHTML = rows
-        .map((r) => {
-          const status = r[3] || "stale";
-          const httpStatus = r[4] === null || r[4] === undefined ? "—" : String(r[4]);
-          const errMsg = r[5] ? escapeHtml(r[5]) : '<span class="null-val">none</span>';
+        .map((p) => {
+          const status = p.status || "stale";
+          const httpStatus =
+            p.http_status === null || p.http_status === undefined ? "—" : String(p.http_status);
+          const errMsg = p.error_message
+            ? escapeHtml(p.error_message)
+            : '<span class="null-val">none</span>';
           return `<tr>
             <td>${renderStatusBadge(status)}</td>
-            <td><span class="badge badge-kind">${escapeHtml(r[1])}</span></td>
-            <td class="mono">${escapeHtml(r[2])}</td>
+            <td><span class="badge badge-kind">${escapeHtml(p.source_name)}</span></td>
+            <td class="mono">${escapeHtml(p.uri)}</td>
             <td class="mono">${escapeHtml(httpStatus)}</td>
             <td>${errMsg}</td>
-            <td class="mono">${escapeHtml(formatTimestamp(r[6]))}</td>
+            <td class="mono">${escapeHtml(formatTimestamp(p.last_checked_at))}</td>
           </tr>`;
         })
         .join("");

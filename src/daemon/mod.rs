@@ -11,15 +11,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use notify::RecursiveMode;
 use notify_debouncer_mini::{new_debouncer, DebounceEventResult};
-use rusqlite::Connection;
 use tokio::sync::{mpsc, Semaphore};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::VaultConfig;
-use crate::db::open_rw_db;
 use crate::error::{Result, VaultError};
-use crate::ingest::{local::canonicalize_local_dir, map_source_record, SourceRecord, SyncSummary};
+use crate::ingest::{self, local::canonicalize_local_dir, SourceKind, SourceRecord, SyncSummary};
 use crate::sources::{SourceLifecycle, SyncOutcome};
 
 use info::{DaemonInfo, DaemonInfoGuard};
@@ -318,48 +316,6 @@ pub(crate) async fn wait_for_shutdown_signal() {
     }
 }
 
-/// Select all `web` sources that are due for refresh at the current wall-clock time.
-pub fn select_due_web_sources(conn: &Connection) -> Result<Vec<SourceRecord>> {
-    let now_secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
-        .unwrap_or(0);
-    select_due_web_sources_at(conn, now_secs)
-}
-
-/// Select all `web` sources that are due for refresh at `now_epoch_secs` (UTC Unix seconds).
-///
-/// A Source is due once `refresh_interval_secs` has passed since its last Sync attempt,
-/// successful or not.
-pub fn select_due_web_sources_at(
-    conn: &Connection,
-    now_epoch_secs: i64,
-) -> Result<Vec<SourceRecord>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, name, kind, origin, tags, include_patterns, exclude_patterns,
-                max_pages, max_depth, render_js, refresh_interval_secs,
-                status, last_synced_at, last_error, created_at
-         FROM (
-             SELECT s.*,
-                    -- Last attempt, failed or not, so a failing Source waits its interval.
-                    MAX(COALESCE(unixepoch(s.last_synced_at), 0),
-                        COALESCE((SELECT MAX(unixepoch(r.started_at))
-                                  FROM sync_runs r WHERE r.source_id = s.id), 0)) AS last_attempt
-             FROM sources s
-         )
-         WHERE kind = 'web'
-           AND refresh_interval_secs > 0
-           AND last_attempt + refresh_interval_secs <= ?1
-         ORDER BY last_attempt ASC, id ASC",
-    )?;
-    let rows = stmt.query_map([now_epoch_secs], map_source_record)?;
-    let mut out = Vec::new();
-    for row in rows {
-        out.push(row?);
-    }
-    Ok(out)
-}
-
 /// Run the background web refresh scheduler with default cadence (60s tick, concurrency 2, 0–30s jitter).
 pub async fn run_scheduler(config: VaultConfig, cancel: CancellationToken) -> Result<()> {
     run_scheduler_with_options(
@@ -512,12 +468,11 @@ fn sync_warning_lines(summary: &SyncSummary) -> Vec<String> {
 }
 
 fn load_due_web_sources(config: &VaultConfig) -> Result<Vec<SourceRecord>> {
-    let db_path = config.db_path();
-    if !db_path.exists() {
-        return Ok(Vec::new());
-    }
-    let conn = open_rw_db(&db_path)?;
-    select_due_web_sources(&conn)
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+        .unwrap_or(0);
+    ingest::due_web_sources(config, now_secs)
 }
 
 fn compute_jitter(max_jitter_secs: u64, source_id: i64) -> Duration {
@@ -635,25 +590,11 @@ async fn watcher_sync(
 }
 
 fn load_local_sources(config: &VaultConfig) -> Result<Vec<SourceRecord>> {
-    let db_path = config.db_path();
-    if !db_path.exists() {
-        return Ok(Vec::new());
-    }
-    let conn = open_rw_db(&db_path)?;
-    let mut stmt = conn.prepare(
-        "SELECT id, name, kind, origin, tags, include_patterns, exclude_patterns,
-                max_pages, max_depth, render_js, refresh_interval_secs,
-                status, last_synced_at, last_error, created_at
-         FROM sources
-         WHERE kind = 'local'
-         ORDER BY id ASC",
-    )?;
-    let rows = stmt.query_map([], map_source_record)?;
-    let mut out = Vec::new();
-    for row in rows {
-        out.push(row?);
-    }
-    Ok(out)
+    let mut sources = ingest::all_sources(config)?;
+    sources.retain(|source| source.kind == SourceKind::Local);
+    // Watch in id order, as before the read module (all_sources is by name).
+    sources.sort_by_key(|source| source.id);
+    Ok(sources)
 }
 
 fn refresh_watched_local_sources(
@@ -802,99 +743,6 @@ mod tests {
         assert_eq!(lines.len(), 2);
         assert!(lines[0].starts_with("dlthub") && lines[0].contains("first warning"));
         assert!(lines[1].starts_with("dlthub") && lines[1].contains("second warning"));
-    }
-
-    #[test]
-    fn selects_only_due_web_sources() {
-        let dir = tempdir().expect("tempdir");
-        let conn = open_rw_db(&dir.path().join("vault.db")).expect("open_rw_db");
-
-        // Reference time: 2026-11-21T12:00:00Z
-        let now_epoch: i64 = conn
-            .query_row("SELECT unixepoch('2026-11-21T12:00:00Z')", [], |r| r.get(0))
-            .expect("unixepoch");
-
-        // 1. Overdue web source (last synced 2h ago, interval 1h) -> DUE
-        conn.execute(
-            "INSERT INTO sources (name, kind, origin, refresh_interval_secs, last_synced_at)
-             VALUES ('overdue-web', 'web', 'https://overdue.example.com', 3600, '2026-11-21T10:00:00Z')",
-            [],
-        )
-        .expect("insert overdue web");
-
-        // 2. Never-synced web source with interval > 0 -> DUE
-        conn.execute(
-            "INSERT INTO sources (name, kind, origin, refresh_interval_secs, last_synced_at)
-             VALUES ('never-synced-web', 'web', 'https://never.example.com', 86400, NULL)",
-            [],
-        )
-        .expect("insert never-synced web");
-
-        // 3. Recently synced web source (last synced 10m ago, interval 1h) -> SKIP
-        conn.execute(
-            "INSERT INTO sources (name, kind, origin, refresh_interval_secs, last_synced_at)
-             VALUES ('recent-web', 'web', 'https://recent.example.com', 3600, '2026-11-21T11:50:00Z')",
-            [],
-        )
-        .expect("insert recent web");
-
-        // 4. Disabled web source (refresh_interval_secs = 0) -> SKIP
-        conn.execute(
-            "INSERT INTO sources (name, kind, origin, refresh_interval_secs, last_synced_at)
-             VALUES ('disabled-web', 'web', 'https://disabled.example.com', 0, NULL)",
-            [],
-        )
-        .expect("insert disabled web");
-
-        // 5. Local source (even if overdue / never synced) -> SKIP
-        conn.execute(
-            "INSERT INTO sources (name, kind, origin, refresh_interval_secs, last_synced_at)
-             VALUES ('local-docs', 'local', '/tmp/local-docs', 3600, NULL)",
-            [],
-        )
-        .expect("insert local");
-
-        // 6. Web source left 'syncing' by a crashed run -> DUE; the Sync claim decides exclusion
-        conn.execute(
-            "INSERT INTO sources (name, kind, origin, refresh_interval_secs, status, last_synced_at)
-             VALUES ('syncing-web', 'web', 'https://syncing.example.com', 86400, 'syncing', NULL)",
-            [],
-        )
-        .expect("insert syncing web");
-
-        let due = select_due_web_sources_at(&conn, now_epoch).expect("select_due_web_sources_at");
-        let mut names: Vec<String> = due.into_iter().map(|s| s.name).collect();
-        names.sort();
-        assert_eq!(
-            names,
-            vec!["never-synced-web", "overdue-web", "syncing-web"]
-        );
-    }
-
-    #[test]
-    fn failed_sync_waits_for_refresh_interval() {
-        let dir = tempdir().expect("tempdir");
-        let conn = open_rw_db(&dir.path().join("vault.db")).expect("open_rw_db");
-        let now_epoch: i64 = 1_800_000_000;
-        // Never synced successfully, but its last attempt failed 10 minutes ago.
-        conn.execute(
-            "INSERT INTO sources (name, kind, origin, refresh_interval_secs, status, last_synced_at)
-             VALUES ('refused', 'web', 'http://10.0.0.5/docs', 3600, 'error', NULL)",
-            [],
-        )
-        .expect("insert refused");
-        conn.execute(
-            "INSERT INTO sync_runs (source_id, started_at, finished_at, status, error_message)
-             VALUES (1, strftime('%Y-%m-%dT%H:%M:%SZ', ?1, 'unixepoch'),
-                     strftime('%Y-%m-%dT%H:%M:%SZ', ?1, 'unixepoch'), 'error', 'refused')",
-            [now_epoch - 600],
-        )
-        .expect("insert failed run");
-
-        let due = select_due_web_sources_at(&conn, now_epoch).expect("due");
-        assert!(due.is_empty(), "retried before its interval: {due:?}");
-        let due_later = select_due_web_sources_at(&conn, now_epoch + 3_000).expect("due later");
-        assert_eq!(due_later.len(), 1);
     }
 
     #[test]

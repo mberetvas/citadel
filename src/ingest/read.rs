@@ -1,0 +1,965 @@
+//! Read views over Sources and Pages: the one place that knows their column lists,
+//! maps their rows, and decides what a missing vault reads as.
+//!
+//! Missing-vault rule: a read never creates the vault. A missing vault reads as an
+//! empty vault: lists are empty, and a lookup by name or id is `NotFound`.
+
+use std::time::{Duration, Instant};
+
+use rusqlite::{params_from_iter, Connection, ErrorCode, OpenFlags, OptionalExtension, Row, ToSql};
+use serde::{Deserialize, Serialize};
+
+use super::{
+    SourceDetail, SourceKind, SourceRecord, SourceSummary, SyncRunRecord, DEFAULT_MAX_DEPTH,
+    DEFAULT_MAX_PAGES,
+};
+use crate::config::VaultConfig;
+use crate::db::DEFAULT_QUERY_TIMEOUT_MS;
+use crate::error::{Result, VaultError};
+
+/// One row of a Page list: a Page's metadata without its content.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PageListItem {
+    pub id: i64,
+    pub source_id: i64,
+    pub source_name: String,
+    pub uri: String,
+    pub title: String,
+    pub word_count: i64,
+    pub status: String,
+    pub http_status: Option<i64>,
+    pub error_message: Option<String>,
+    pub first_seen_at: String,
+    pub last_checked_at: String,
+    pub last_changed_at: String,
+}
+
+/// The set of Page statuses a Page list keeps; the empty set keeps every Page.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PageStatuses {
+    active: bool,
+    stale: bool,
+    error: bool,
+}
+
+impl PageStatuses {
+    /// Every Page, whatever its status.
+    pub const ANY: Self = Self {
+        active: false,
+        stale: false,
+        error: false,
+    };
+    /// Stale pages and Error pages.
+    pub const STALE_OR_ERROR: Self = Self {
+        active: false,
+        stale: true,
+        error: true,
+    };
+
+    /// Parse a comma-separated subset of `active,stale,error`; blank means every status.
+    pub fn parse(raw: &str) -> Result<Self> {
+        let mut out = Self::ANY;
+        for part in raw.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+            match part {
+                "active" => out.active = true,
+                "stale" => out.stale = true,
+                "error" => out.error = true,
+                other => return Err(invalid_status(other)),
+            }
+        }
+        Ok(out)
+    }
+
+    fn is_any(self) -> bool {
+        self == Self::ANY
+    }
+}
+
+fn invalid_status(status: &str) -> VaultError {
+    VaultError::Validation(format!(
+        "invalid page status '{status}'; expected one or more of: active, stale, error"
+    ))
+}
+
+/// Which Pages a Page list returns.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PageQuery {
+    /// One Source, or every Source when `None`.
+    pub source_id: Option<i64>,
+    pub statuses: PageStatuses,
+    /// Search term; blank means no search.
+    pub search: Option<String>,
+    /// At most this many Pages, in list order; every match when `None`.
+    pub limit: Option<u32>,
+    pub order: PageOrder,
+}
+
+/// The order of a Page list.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PageOrder {
+    /// By search rank when searching, then by URI.
+    #[default]
+    Uri,
+    /// Newest `last_checked_at` first, then by URI (a search does not rank).
+    NewestChecked,
+}
+
+impl PageOrder {
+    /// Parse `uri` or `checked`; blank means `uri`.
+    pub fn parse(raw: &str) -> Result<Self> {
+        match raw.trim() {
+            "" | "uri" => Ok(Self::Uri),
+            "checked" => Ok(Self::NewestChecked),
+            other => Err(VaultError::Validation(format!(
+                "invalid page order '{other}'; expected one of: uri, checked"
+            ))),
+        }
+    }
+}
+
+const SOURCE_COLUMNS: &str = "id, name, kind, origin, tags, include_patterns, exclude_patterns,
+     max_pages, max_depth, render_js, refresh_interval_secs,
+     status, last_synced_at, last_error, created_at";
+
+const PAGE_LIST_SELECT: &str = "SELECT p.id, p.source_id, s.name AS source_name, p.uri, p.title,
+            p.word_count, p.status, p.http_status, p.error_message,
+            p.first_seen_at, p.last_checked_at, p.last_changed_at
+     FROM pages p
+     JOIN sources s ON s.id = p.source_id";
+
+const PAGE_LIST_FILTER: &str = "(?1 IS NULL OR p.source_id = ?1)
+       AND (?2 OR (?3 AND p.status = 'active') OR (?4 AND p.status = 'stale')
+                 OR (?5 AND p.status = 'error'))";
+
+/// List Pages of one Source or of every Source, filtered by status and search term.
+///
+/// A search matches each word of the term as an FTS5 phrase in the title and Markdown
+/// content (a trailing `*` makes it a prefix), or the whole term as a substring of the
+/// URI. Matches are ranked by `bm25`, then by URI; without a search, Pages are ordered
+/// by URI. The term cannot fail to parse, so every SQLite error is a real one and is
+/// returned.
+pub fn list_pages(config: &VaultConfig, query: &PageQuery) -> Result<Vec<PageListItem>> {
+    read_vault(config, || Ok(Vec::new()), |conn| query_pages(conn, query))
+}
+
+fn query_pages(conn: &Connection, query: &PageQuery) -> Result<Vec<PageListItem>> {
+    let st = query.statuses;
+    let any = st.is_any();
+    let term = query
+        .search
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty());
+    let search = term.map(|t| (fts_phrases(t), like_substring(t)));
+    let mut binds: Vec<&dyn ToSql> = vec![&query.source_id, &any, &st.active, &st.stale, &st.error];
+    if let Some((phrases, pattern)) = &search {
+        binds.push(phrases);
+        binds.push(pattern);
+    }
+    let mut sql = page_list_sql(search.is_some(), query.order);
+    if let Some(limit) = &query.limit {
+        // `?` takes the next number after the highest bound so far.
+        sql.push_str(" LIMIT ?");
+        binds.push(limit);
+    }
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map(params_from_iter(binds), map_page_list_item)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// The Page list SQL. Binds: `?1` source id, `?2..?5` status flags, and with a
+/// search, `?6` the FTS5 phrases and `?7` the URI `LIKE` pattern.
+fn page_list_sql(with_search: bool, order: PageOrder) -> String {
+    let order_by = match (order, with_search) {
+        (PageOrder::NewestChecked, _) => "p.last_checked_at DESC, p.uri ASC",
+        (PageOrder::Uri, true) => "m.rank IS NULL, m.rank, p.uri ASC",
+        (PageOrder::Uri, false) => "p.uri ASC",
+    };
+    if !with_search {
+        return format!("{PAGE_LIST_SELECT} WHERE {PAGE_LIST_FILTER} ORDER BY {order_by}");
+    }
+    // MATERIALIZED runs the MATCH once; flattened into the join, SQLite would run one
+    // FTS lookup per Page row (a short prefix took minutes on 10k Pages).
+    format!(
+        "WITH m AS MATERIALIZED (
+             SELECT rowid AS page_id, bm25(pages_fts) AS rank
+             FROM pages_fts WHERE pages_fts MATCH ?6
+         )
+         {PAGE_LIST_SELECT}
+         LEFT JOIN m ON m.page_id = p.id
+         WHERE {PAGE_LIST_FILTER}
+           AND (m.page_id IS NOT NULL OR p.uri LIKE ?7 ESCAPE '\\')
+         ORDER BY {order_by}"
+    )
+}
+
+/// Quote each word as an FTS5 phrase, so no user input is parsed as FTS5 syntax.
+/// A trailing `*` on a word keeps its prefix meaning.
+fn fts_phrases(term: &str) -> String {
+    term.split_whitespace()
+        .map(|word| match word.strip_suffix('*') {
+            Some(stem) if !stem.is_empty() => format!("\"{}\"*", stem.replace('"', "\"\"")),
+            _ => format!("\"{}\"", word.replace('"', "\"\"")),
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// A `LIKE … ESCAPE '\'` pattern matching `term` as a literal substring.
+fn like_substring(term: &str) -> String {
+    let mut out = String::with_capacity(term.len() + 2);
+    out.push('%');
+    for ch in term.chars() {
+        if matches!(ch, '%' | '_' | '\\') {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out.push('%');
+    out
+}
+
+fn map_page_list_item(row: &Row<'_>) -> rusqlite::Result<PageListItem> {
+    Ok(PageListItem {
+        id: row.get("id")?,
+        source_id: row.get("source_id")?,
+        source_name: row.get("source_name")?,
+        uri: row.get("uri")?,
+        title: row.get("title")?,
+        word_count: row.get("word_count")?,
+        status: row.get("status")?,
+        http_status: row.get("http_status")?,
+        error_message: row.get("error_message")?,
+        first_seen_at: row.get("first_seen_at")?,
+        last_checked_at: row.get("last_checked_at")?,
+        last_changed_at: row.get("last_changed_at")?,
+    })
+}
+
+/// List all Sources with live Page and word counts from `v_sources`, by name.
+pub fn list_sources(config: &VaultConfig) -> Result<Vec<SourceSummary>> {
+    read_vault(config, || Ok(Vec::new()), select_source_summaries)
+}
+
+fn select_source_summaries(conn: &Connection) -> Result<Vec<SourceSummary>> {
+    let sql = format!(
+        "SELECT {SOURCE_COLUMNS}, active_pages, stale_pages, error_pages, total_words
+         FROM v_sources ORDER BY name ASC"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map([], map_source_summary)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// One Source by name, with its last 10 Sync runs and its Stale and Error pages.
+pub fn show_source(config: &VaultConfig, name: &str) -> Result<SourceDetail> {
+    let not_found = || VaultError::NotFound(format!("source '{name}' not found"));
+    read_vault(
+        config,
+        || Err(not_found()),
+        |conn| select_source_detail(conn, name),
+    )
+}
+
+fn select_source_detail(conn: &Connection, name: &str) -> Result<SourceDetail> {
+    let not_found = || VaultError::NotFound(format!("source '{name}' not found"));
+    let sql = format!(
+        "SELECT {SOURCE_COLUMNS}, active_pages, stale_pages, error_pages, total_words
+         FROM v_sources WHERE name = ?1"
+    );
+    let source = conn
+        .query_row(&sql, [name], map_source_summary)
+        .optional()?
+        .ok_or_else(not_found)?;
+
+    let mut runs_stmt = conn.prepare(
+        "SELECT id, source_id, started_at, finished_at, status,
+                pages_added, pages_updated, pages_unchanged, pages_stale, pages_failed, error_message
+         FROM sync_runs
+         WHERE source_id = ?1
+         ORDER BY id DESC
+         LIMIT 10",
+    )?;
+    let sync_runs = runs_stmt
+        .query_map([source.id], |row| {
+            Ok(SyncRunRecord {
+                id: row.get("id")?,
+                source_id: row.get("source_id")?,
+                started_at: row.get("started_at")?,
+                finished_at: row.get("finished_at")?,
+                status: row.get("status")?,
+                pages_added: row.get("pages_added")?,
+                pages_updated: row.get("pages_updated")?,
+                pages_unchanged: row.get("pages_unchanged")?,
+                pages_stale: row.get("pages_stale")?,
+                pages_failed: row.get("pages_failed")?,
+                error_message: row.get("error_message")?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    let issue_pages = query_pages(
+        conn,
+        &PageQuery {
+            source_id: Some(source.id),
+            statuses: PageStatuses::STALE_OR_ERROR,
+            search: None,
+            limit: None,
+            order: PageOrder::Uri,
+        },
+    )?;
+
+    Ok(SourceDetail {
+        source,
+        sync_runs,
+        issue_pages,
+    })
+}
+
+/// One Source by id (when `key` is an integer that names one) or else by name.
+pub fn find_source(config: &VaultConfig, key: &str) -> Result<SourceRecord> {
+    let not_found = || VaultError::NotFound(format!("source '{key}' not found"));
+    read_vault(
+        config,
+        || Err(not_found()),
+        |conn| {
+            if let Ok(id) = key.parse::<i64>() {
+                if let Some(found) = select_one_source(conn, "id = ?1", id)? {
+                    return Ok(found);
+                }
+            }
+            select_one_source(conn, "name = ?1", key)?.ok_or_else(not_found)
+        },
+    )
+}
+
+/// Every Source, by name.
+pub fn all_sources(config: &VaultConfig) -> Result<Vec<SourceRecord>> {
+    read_vault(config, || Ok(Vec::new()), load_all_sources)
+}
+
+/// Web Sources due for refresh at `now_epoch_secs` (UTC Unix seconds), longest-waiting
+/// first. A Source is due once `refresh_interval_secs` has passed since its last Sync
+/// attempt, successful or not; an interval of 0 means manual only.
+pub fn due_web_sources(config: &VaultConfig, now_epoch_secs: i64) -> Result<Vec<SourceRecord>> {
+    read_vault(
+        config,
+        || Ok(Vec::new()),
+        |conn| select_due_web_sources(conn, now_epoch_secs),
+    )
+}
+
+fn select_due_web_sources(conn: &Connection, now_epoch_secs: i64) -> Result<Vec<SourceRecord>> {
+    let sql = format!(
+        "SELECT {SOURCE_COLUMNS}
+         FROM (
+             SELECT s.*,
+                    -- Last attempt, failed or not, so a failing Source waits its interval.
+                    MAX(COALESCE(unixepoch(s.last_synced_at), 0),
+                        COALESCE((SELECT MAX(unixepoch(r.started_at))
+                                  FROM sync_runs r WHERE r.source_id = s.id), 0)) AS last_attempt
+             FROM sources s
+         )
+         WHERE kind = 'web'
+           AND refresh_interval_secs > 0
+           AND last_attempt + refresh_interval_secs <= ?1
+         ORDER BY last_attempt ASC, id ASC"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map([now_epoch_secs], map_source_record)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// How long a read waits for a writer's lock before failing with `SQLITE_BUSY`.
+const READ_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long one vault read may run before it stops with `QueryTimeout`; the same
+/// default as MCP `query` (`db/readonly.rs`).
+const READ_TIMEOUT: Duration = Duration::from_millis(DEFAULT_QUERY_TIMEOUT_MS);
+
+/// Run `read` on the vault, or `absent` when the vault does not exist. This is the
+/// missing-vault rule: never create the vault, never write. `read` stops with
+/// `QueryTimeout` once it has run for 5 s.
+pub(crate) fn read_vault<T>(
+    config: &VaultConfig,
+    absent: impl FnOnce() -> Result<T>,
+    read: impl FnOnce(&Connection) -> Result<T>,
+) -> Result<T> {
+    read_vault_within(config, READ_TIMEOUT, absent, read)
+}
+
+fn read_vault_within<T>(
+    config: &VaultConfig,
+    timeout: Duration,
+    absent: impl FnOnce() -> Result<T>,
+    read: impl FnOnce(&Connection) -> Result<T>,
+) -> Result<T> {
+    let path = config.db_path();
+    if !path.exists() {
+        return absent();
+    }
+    // Read-only, and skipping the schema batch that `open_rw_db` re-runs.
+    let conn = Connection::open_with_flags(
+        &path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    conn.busy_timeout(READ_BUSY_TIMEOUT)?;
+    let started = Instant::now();
+    conn.progress_handler(1000, Some(move || started.elapsed() >= timeout))?;
+    read(&conn).map_err(|err| match err {
+        VaultError::Sqlite(ref sqlite)
+            if sqlite.sqlite_error_code() == Some(ErrorCode::OperationInterrupted) =>
+        {
+            VaultError::QueryTimeout(format!(
+                "vault read exceeded {} ms timeout",
+                timeout.as_millis()
+            ))
+        }
+        other => other,
+    })
+}
+
+pub(crate) fn load_source_by_id(conn: &Connection, id: i64) -> Result<SourceRecord> {
+    select_one_source(conn, "id = ?1", id)?
+        .ok_or_else(|| VaultError::NotFound(format!("source id {id} not found")))
+}
+
+pub(crate) fn load_source_by_name(conn: &Connection, name: &str) -> Result<SourceRecord> {
+    select_one_source(conn, "name = ?1", name)?
+        .ok_or_else(|| VaultError::NotFound(format!("source '{name}' not found")))
+}
+
+pub(crate) fn load_all_sources(conn: &Connection) -> Result<Vec<SourceRecord>> {
+    let sql = format!("SELECT {SOURCE_COLUMNS} FROM sources ORDER BY name ASC");
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map([], map_source_record)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+fn select_one_source(
+    conn: &Connection,
+    condition: &str,
+    value: impl rusqlite::ToSql,
+) -> Result<Option<SourceRecord>> {
+    let sql = format!("SELECT {SOURCE_COLUMNS} FROM sources WHERE {condition}");
+    Ok(conn
+        .query_row(&sql, [value], map_source_record)
+        .optional()?)
+}
+
+fn map_source_record(row: &Row<'_>) -> rusqlite::Result<SourceRecord> {
+    let kind_raw: String = row.get("kind")?;
+    let kind =
+        SourceKind::from_db(&kind_raw).map_err(|e| conversion_error(row, "kind", Box::new(e)))?;
+    Ok(SourceRecord {
+        id: row.get("id")?,
+        name: row.get("name")?,
+        kind,
+        origin: row.get("origin")?,
+        tags: json_list(row, "tags")?,
+        include_patterns: json_list(row, "include_patterns")?,
+        exclude_patterns: json_list(row, "exclude_patterns")?,
+        max_pages: stored_limit(row, "max_pages", DEFAULT_MAX_PAGES)?,
+        max_depth: stored_limit(row, "max_depth", DEFAULT_MAX_DEPTH)?,
+        render_js: row.get::<_, i64>("render_js")? != 0,
+        refresh_interval_secs: row.get("refresh_interval_secs")?,
+        status: row.get("status")?,
+        last_synced_at: row.get("last_synced_at")?,
+        last_error: row.get("last_error")?,
+        created_at: row.get("created_at")?,
+    })
+}
+
+fn map_source_summary(row: &Row<'_>) -> rusqlite::Result<SourceSummary> {
+    let base = map_source_record(row)?;
+    Ok(SourceSummary {
+        id: base.id,
+        name: base.name,
+        kind: base.kind,
+        origin: base.origin,
+        tags: base.tags,
+        include_patterns: base.include_patterns,
+        exclude_patterns: base.exclude_patterns,
+        max_pages: base.max_pages,
+        max_depth: base.max_depth,
+        render_js: base.render_js,
+        refresh_interval_secs: base.refresh_interval_secs,
+        status: base.status,
+        last_synced_at: base.last_synced_at,
+        last_error: base.last_error,
+        created_at: base.created_at,
+        active_pages: row.get("active_pages")?,
+        stale_pages: row.get("stale_pages")?,
+        error_pages: row.get("error_pages")?,
+        total_words: row.get("total_words")?,
+    })
+}
+
+/// A stored `max_pages`/`max_depth`. A value outside `u32` (only a hand edit of
+/// `vault.db` can store one) is logged and read as `default`, so one bad row cannot
+/// break every Source list, the scheduler, the watcher or a delete.
+fn stored_limit(row: &Row<'_>, column: &str, default: u32) -> rusqlite::Result<u32> {
+    let raw: i64 = row.get(column)?;
+    Ok(u32::try_from(raw).unwrap_or_else(|_| {
+        let source_id: Option<i64> = row.get("id").ok();
+        tracing::warn!(
+            source_id,
+            column,
+            stored = raw,
+            default,
+            "stored Source limit is out of range; using the default"
+        );
+        default
+    }))
+}
+
+fn json_list(row: &Row<'_>, column: &str) -> rusqlite::Result<Vec<String>> {
+    let raw: String = row.get(column)?;
+    serde_json::from_str(&raw).map_err(|e| conversion_error(row, column, Box::new(e)))
+}
+
+/// A conversion error for a TEXT column (`kind` and the JSON lists).
+fn conversion_error(
+    row: &Row<'_>,
+    column: &str,
+    err: Box<dyn std::error::Error + Send + Sync>,
+) -> rusqlite::Error {
+    match row.as_ref().column_index(column) {
+        Ok(idx) => rusqlite::Error::FromSqlConversionFailure(idx, rusqlite::types::Type::Text, err),
+        Err(lookup) => lookup,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::open_rw_db;
+    use tempfile::{tempdir, TempDir};
+
+    /// A tempdir vault with two Sources: `alpha` (web) and `beta` (local).
+    fn seeded_vault() -> (TempDir, VaultConfig) {
+        let dir = tempdir().expect("tempdir");
+        let config = VaultConfig::new(dir.path());
+        let conn = open_rw_db(&config.db_path()).expect("open_rw_db");
+        conn.execute_batch(
+            "INSERT INTO sources (id, name, kind, origin) VALUES
+                 (1, 'alpha', 'web', 'https://alpha.example.com/'),
+                 (2, 'beta', 'local', '/tmp/beta');
+             INSERT INTO pages (source_id, uri, title, content_md, content_hash, status,
+                                http_status, error_message, last_checked_at) VALUES
+                 (1, 'https://alpha.example.com/guide', 'Alpha guide',
+                  'Install the vault with cargo.', 'h1', 'active', 200, NULL, '2026-11-01T00:00:00Z'),
+                 (1, 'https://alpha.example.com/api/v2/missing', 'Gone',
+                  'Old copy about tokio-runtime.', 'h2', 'error', 404, 'HTTP 404', '2026-11-03T00:00:00Z'),
+                 (1, 'https://alpha.example.com/old', 'Old',
+                  'Retired page.', 'h3', 'stale', NULL, NULL, '2026-11-02T00:00:00Z'),
+                 (2, 'notes.md', 'Beta notes',
+                  'Guides for the vault.', 'h4', 'active', NULL, NULL, '2026-11-01T00:00:00Z');",
+        )
+        .expect("seed vault");
+        (dir, config)
+    }
+
+    fn uris(pages: &[PageListItem]) -> Vec<&str> {
+        pages.iter().map(|p| p.uri.as_str()).collect()
+    }
+
+    fn search(term: &str) -> PageQuery {
+        PageQuery {
+            search: Some(term.to_string()),
+            ..PageQuery::default()
+        }
+    }
+
+    #[test]
+    fn lists_pages_of_every_source_with_http_status() {
+        let (_dir, config) = seeded_vault();
+        let pages = list_pages(&config, &PageQuery::default()).expect("list all");
+        assert_eq!(pages.len(), 4);
+        let gone = pages
+            .iter()
+            .find(|p| p.uri.ends_with("/missing"))
+            .expect("error page listed");
+        assert_eq!(gone.source_name, "alpha");
+        assert_eq!(gone.http_status, Some(404));
+        assert_eq!(gone.error_message.as_deref(), Some("HTTP 404"));
+        assert!(pages.iter().any(|p| p.source_name == "beta"));
+    }
+
+    #[test]
+    fn page_list_has_no_row_cap_without_a_limit() {
+        let (_dir, config) = seeded_vault();
+        let conn = open_rw_db(&config.db_path()).expect("open_rw_db");
+        for i in 0..150 {
+            conn.execute(
+                "INSERT INTO pages (source_id, uri, content_md, content_hash)
+                 VALUES (2, ?1, 'x', 'h')",
+                [format!("bulk/{i:03}.md")],
+            )
+            .expect("insert bulk page");
+        }
+        let pages = list_pages(&config, &PageQuery::default()).expect("list all");
+        assert_eq!(pages.len(), 154);
+    }
+
+    #[test]
+    fn limits_a_page_list_in_list_order() {
+        let (_dir, config) = seeded_vault();
+        for query in [
+            PageQuery::default(),
+            PageQuery {
+                search: Some("vault".into()),
+                ..PageQuery::default()
+            },
+        ] {
+            let all = list_pages(&config, &query).expect("all");
+            let first = list_pages(
+                &config,
+                &PageQuery {
+                    limit: Some(1),
+                    ..query.clone()
+                },
+            )
+            .expect("limited");
+            assert_eq!(uris(&first), uris(&all[..1]), "{query:?}");
+        }
+    }
+
+    #[test]
+    fn newest_checked_order_keeps_the_newest_checks_under_a_limit() {
+        let (_dir, config) = seeded_vault();
+        let newest = list_pages(
+            &config,
+            &PageQuery {
+                statuses: PageStatuses::STALE_OR_ERROR,
+                limit: Some(1),
+                order: PageOrder::NewestChecked,
+                ..PageQuery::default()
+            },
+        )
+        .expect("newest checked");
+        assert_eq!(
+            uris(&newest),
+            vec!["https://alpha.example.com/api/v2/missing"]
+        );
+        assert_eq!(
+            PageOrder::parse("checked").expect("parse"),
+            PageOrder::NewestChecked
+        );
+        assert_eq!(PageOrder::parse("").expect("parse blank"), PageOrder::Uri);
+        assert!(PageOrder::parse("newest").is_err());
+    }
+
+    #[test]
+    fn filters_pages_by_source_and_status_set() {
+        let (_dir, config) = seeded_vault();
+        let issues = list_pages(
+            &config,
+            &PageQuery {
+                statuses: PageStatuses::parse("stale, error").expect("parse"),
+                ..PageQuery::default()
+            },
+        )
+        .expect("stale or error");
+        assert_eq!(
+            uris(&issues),
+            vec![
+                "https://alpha.example.com/api/v2/missing",
+                "https://alpha.example.com/old"
+            ]
+        );
+
+        let beta = list_pages(
+            &config,
+            &PageQuery {
+                source_id: Some(2),
+                statuses: PageStatuses::parse("active").expect("parse"),
+                ..PageQuery::default()
+            },
+        )
+        .expect("beta active");
+        assert_eq!(uris(&beta), vec!["notes.md"]);
+    }
+
+    #[test]
+    fn rejects_unknown_page_status() {
+        assert_eq!(PageStatuses::parse("").expect("blank"), PageStatuses::ANY);
+        assert_eq!(
+            PageStatuses::parse("error,stale").expect("pair"),
+            PageStatuses::STALE_OR_ERROR
+        );
+        assert!(matches!(
+            PageStatuses::parse("active,gone"),
+            Err(VaultError::Validation(_))
+        ));
+    }
+
+    #[test]
+    fn search_matches_words_in_content_and_substrings_of_the_uri() {
+        let (_dir, config) = seeded_vault();
+        // Stemmed FTS word match in title or content, across Sources ("Guides").
+        let found = list_pages(&config, &search("guide")).expect("search guide");
+        let mut found = uris(&found);
+        found.sort_unstable();
+        assert_eq!(found, vec!["https://alpha.example.com/guide", "notes.md"]);
+        // URI substring, which FTS does not index.
+        let found = list_pages(&config, &search("api/v2")).expect("search uri");
+        assert_eq!(
+            uris(&found),
+            vec!["https://alpha.example.com/api/v2/missing"]
+        );
+        // Prefix search keeps working.
+        let found = list_pages(&config, &search("instal*")).expect("search prefix");
+        assert_eq!(uris(&found), vec!["https://alpha.example.com/guide"]);
+    }
+
+    #[test]
+    fn search_terms_that_fts5_rejects_do_not_fail() {
+        let (_dir, config) = seeded_vault();
+        for term in [
+            "tokio-runtime",
+            "\"unterminated",
+            "foo:bar",
+            "a AND",
+            "*",
+            "NEAR(",
+            "\"",
+            "say \"hi\"",
+        ] {
+            list_pages(&config, &search(term))
+                .unwrap_or_else(|err| panic!("search {term:?} failed: {err}"));
+        }
+        let found = list_pages(&config, &search("tokio-runtime")).expect("hyphenated");
+        assert_eq!(
+            uris(&found),
+            vec!["https://alpha.example.com/api/v2/missing"]
+        );
+    }
+
+    #[test]
+    fn search_runs_the_fts_match_once_not_per_page() {
+        let (_dir, config) = seeded_vault();
+        let conn = open_rw_db(&config.db_path()).expect("open_rw_db");
+        let plan: Vec<String> = conn
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN {}",
+                page_list_sql(true, PageOrder::Uri)
+            ))
+            .expect("prepare plan")
+            .query_map(
+                rusqlite::params![
+                    None::<i64>,
+                    true,
+                    false,
+                    false,
+                    false,
+                    "\"guide\"",
+                    "%guide%"
+                ],
+                |row| row.get::<_, String>("detail"),
+            )
+            .expect("query plan")
+            .collect::<rusqlite::Result<_>>()
+            .expect("plan rows");
+        // A pages_fts lookup inside the join loop means one MATCH per Page row.
+        assert!(
+            !plan
+                .iter()
+                .any(|line| line.contains("pages_fts") && line.contains("LEFT-JOIN")),
+            "MATCH is evaluated per Page row: {plan:#?}"
+        );
+    }
+
+    #[test]
+    fn reads_past_the_deadline_time_out() {
+        let (_dir, config) = seeded_vault();
+        let conn = open_rw_db(&config.db_path()).expect("open_rw_db");
+        for i in 0..500 {
+            conn.execute(
+                "INSERT INTO pages (source_id, uri, content_md, content_hash)
+                 VALUES (2, ?1, 'Body text about the vault.', 'h')",
+                [format!("bulk/{i:03}.md")],
+            )
+            .expect("insert bulk page");
+        }
+        drop(conn);
+        let query = search("vault");
+        let err = read_vault_within(
+            &config,
+            Duration::ZERO,
+            || Ok(Vec::new()),
+            |conn| query_pages(conn, &query),
+        )
+        .expect_err("a read past its deadline must stop");
+        assert!(matches!(err, VaultError::QueryTimeout(_)), "{err:?}");
+        // The same read within the default deadline succeeds.
+        assert_eq!(list_pages(&config, &query).expect("list").len(), 502);
+    }
+
+    #[test]
+    fn search_surfaces_real_errors() {
+        let (_dir, config) = seeded_vault();
+        let conn = open_rw_db(&config.db_path()).expect("open_rw_db");
+        conn.execute_batch(
+            "DROP TRIGGER IF EXISTS pages_ai; DROP TRIGGER IF EXISTS pages_ad;
+             DROP TRIGGER IF EXISTS pages_au; DROP TABLE pages_fts;",
+        )
+        .expect("break pages_fts");
+        drop(conn);
+        let err = list_pages(&config, &search("guide")).expect_err("broken index must fail");
+        assert!(err.to_string().contains("pages_fts"), "{err}");
+    }
+
+    #[test]
+    fn missing_vault_reads_as_empty_and_is_not_created() {
+        let dir = tempdir().expect("tempdir");
+        let config = VaultConfig::new(dir.path().join("absent"));
+
+        assert!(list_sources(&config).expect("list").is_empty());
+        assert!(all_sources(&config).expect("all").is_empty());
+        assert!(due_web_sources(&config, 0).expect("due").is_empty());
+        assert!(list_pages(&config, &search("x")).expect("pages").is_empty());
+        assert!(matches!(
+            show_source(&config, "alpha"),
+            Err(VaultError::NotFound(_))
+        ));
+        assert!(matches!(
+            find_source(&config, "1"),
+            Err(VaultError::NotFound(_))
+        ));
+        assert!(!config.db_path().exists(), "a read created the vault");
+    }
+
+    #[test]
+    fn finds_sources_by_id_then_name() {
+        let (_dir, config) = seeded_vault();
+        assert_eq!(find_source(&config, "2").expect("by id").name, "beta");
+        assert_eq!(find_source(&config, "alpha").expect("by name").id, 1);
+        assert!(matches!(
+            find_source(&config, "99"),
+            Err(VaultError::NotFound(_))
+        ));
+        let names: Vec<String> = all_sources(&config)
+            .expect("all")
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert_eq!(names, vec!["alpha", "beta"]);
+    }
+
+    #[test]
+    fn show_source_lists_stale_and_error_pages() {
+        let (_dir, config) = seeded_vault();
+        let detail = show_source(&config, "alpha").expect("show alpha");
+        assert_eq!(detail.source.kind, SourceKind::Web);
+        assert_eq!(detail.source.active_pages, 1);
+        assert_eq!(
+            uris(&detail.issue_pages),
+            vec![
+                "https://alpha.example.com/api/v2/missing",
+                "https://alpha.example.com/old"
+            ]
+        );
+        assert_eq!(detail.issue_pages[0].http_status, Some(404));
+    }
+
+    #[test]
+    fn out_of_range_stored_limit_does_not_break_other_reads() {
+        let (_dir, config) = seeded_vault();
+        let conn = open_rw_db(&config.db_path()).expect("open_rw_db");
+        conn.execute(
+            "UPDATE sources SET max_pages = -1, max_depth = 5000000000,
+                                refresh_interval_secs = 60
+             WHERE id = 1",
+            [],
+        )
+        .expect("corrupt limits");
+        drop(conn);
+
+        // The bad row reads with the defaults; every list, the scheduler's due read and
+        // the lookup that UI delete/sync use keep working.
+        let alpha = find_source(&config, "alpha").expect("lookup bad Source");
+        assert_eq!((alpha.max_pages, alpha.max_depth), (500, 5));
+        assert_eq!(list_sources(&config).expect("list").len(), 2);
+        assert_eq!(all_sources(&config).expect("all").len(), 2);
+        let due = due_web_sources(&config, i64::from(u32::MAX)).expect("due");
+        assert_eq!(due.len(), 1);
+    }
+
+    #[test]
+    fn selects_only_due_web_sources() {
+        let dir = tempdir().expect("tempdir");
+        let config = VaultConfig::new(dir.path());
+        let conn = open_rw_db(&config.db_path()).expect("open_rw_db");
+
+        // Reference time: 2026-11-21T12:00:00Z
+        let now_epoch: i64 = conn
+            .query_row("SELECT unixepoch('2026-11-21T12:00:00Z')", [], |r| r.get(0))
+            .expect("unixepoch");
+
+        conn.execute_batch(
+            "INSERT INTO sources (name, kind, origin, refresh_interval_secs, status, last_synced_at) VALUES
+                 -- Overdue (last synced 2h ago, interval 1h): due
+                 ('overdue-web', 'web', 'https://overdue.example.com', 3600, 'ok', '2026-11-21T10:00:00Z'),
+                 -- Never synced, interval > 0: due
+                 ('never-synced-web', 'web', 'https://never.example.com', 86400, 'idle', NULL),
+                 -- Synced 10m ago, interval 1h: skip
+                 ('recent-web', 'web', 'https://recent.example.com', 3600, 'ok', '2026-11-21T11:50:00Z'),
+                 -- Manual only: skip
+                 ('disabled-web', 'web', 'https://disabled.example.com', 0, 'idle', NULL),
+                 -- Local, even if never synced: skip
+                 ('local-docs', 'local', '/tmp/local-docs', 3600, 'idle', NULL),
+                 -- Left 'syncing' by a crashed run: due; the Sync claim decides exclusion
+                 ('syncing-web', 'web', 'https://syncing.example.com', 86400, 'syncing', NULL);",
+        )
+        .expect("seed sources");
+        drop(conn);
+
+        let mut names: Vec<String> = due_web_sources(&config, now_epoch)
+            .expect("due_web_sources")
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec!["never-synced-web", "overdue-web", "syncing-web"]
+        );
+    }
+
+    #[test]
+    fn failed_sync_waits_for_refresh_interval() {
+        let dir = tempdir().expect("tempdir");
+        let config = VaultConfig::new(dir.path());
+        let conn = open_rw_db(&config.db_path()).expect("open_rw_db");
+        let now_epoch: i64 = 1_800_000_000;
+        // Never synced successfully, but its last attempt failed 10 minutes ago.
+        conn.execute(
+            "INSERT INTO sources (name, kind, origin, refresh_interval_secs, status, last_synced_at)
+             VALUES ('refused', 'web', 'http://10.0.0.5/docs', 3600, 'error', NULL)",
+            [],
+        )
+        .expect("insert refused");
+        conn.execute(
+            "INSERT INTO sync_runs (source_id, started_at, finished_at, status, error_message)
+             VALUES (1, strftime('%Y-%m-%dT%H:%M:%SZ', ?1, 'unixepoch'),
+                     strftime('%Y-%m-%dT%H:%M:%SZ', ?1, 'unixepoch'), 'error', 'refused')",
+            [now_epoch - 600],
+        )
+        .expect("insert failed run");
+        drop(conn);
+
+        let due = due_web_sources(&config, now_epoch).expect("due");
+        assert!(due.is_empty(), "retried before its interval: {due:?}");
+        let due_later = due_web_sources(&config, now_epoch + 3_000).expect("due later");
+        assert_eq!(due_later.len(), 1);
+    }
+}
