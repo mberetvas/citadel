@@ -236,6 +236,121 @@ fn uninstall_service_for_platform() -> Result<Option<PathBuf>> {
     ))
 }
 
+/// Ask the OS service manager to start the installed service; a no-op when it already runs.
+pub fn start_service() -> Result<()> {
+    start_service_for_platform()
+}
+
+/// How long `launchctl bootstrap` is retried while launchd finishes unloading the job.
+#[cfg(target_os = "macos")]
+const LAUNCHD_RELOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Load the job again rather than `launchctl kickstart` it: after the binary is replaced,
+/// launchd can refuse to spawn the loaded job (`EX_CONFIG`, "needs LWCR update"), and
+/// `kickstart` then exits 0 without starting it. Bootstrapping starts it (`RunAtLoad`).
+#[cfg(target_os = "macos")]
+fn start_service_for_platform() -> Result<()> {
+    let [bootout, bootstrap] = launchd_reload_args(current_uid()?, &launchd_plist_path()?);
+    let bootout: Vec<&str> = bootout.iter().map(String::as_str).collect();
+    let bootstrap: Vec<&str> = bootstrap.iter().map(String::as_str).collect();
+    // Best-effort, like the `unload` in `install_service_for_platform`.
+    let _ = run_service_command("launchctl", &bootout);
+    // `bootout` returns while launchd may still be stopping a running instance (up to its
+    // exit timeout); `bootstrap` fails (5: Input/output error) until the job is gone.
+    retry_for(
+        LAUNCHD_RELOAD_TIMEOUT,
+        std::time::Duration::from_millis(250),
+        || run_service_command("launchctl", &bootstrap),
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn start_service_for_platform() -> Result<()> {
+    run_service_command("systemctl", &["--user", "start", SYSTEMD_SERVICE_NAME])
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn start_service_for_platform() -> Result<()> {
+    Err(VaultError::Other(
+        "OS service start is only supported on macOS (launchd) and Linux (systemd --user)".into(),
+    ))
+}
+
+/// Run a service manager command, failing with its stderr when it cannot run or exits non-zero.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn run_service_command(program: &str, args: &[&str]) -> Result<()> {
+    let command = format!("{program} {}", args.join(" "));
+    let output = std::process::Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|err| VaultError::Other(format!("could not run `{command}`: {err}")))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(VaultError::Other(format!(
+            "`{command}` failed (exit status {}): {}",
+            output.status,
+            stderr.trim()
+        )));
+    }
+    Ok(())
+}
+
+/// The current user's id, from `id -u`.
+#[cfg(target_os = "macos")]
+fn current_uid() -> Result<u32> {
+    let output = std::process::Command::new("id")
+        .arg("-u")
+        .output()
+        .map_err(|err| VaultError::Other(format!("could not run `id -u`: {err}")))?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    match text.trim().parse() {
+        Ok(uid) if output.status.success() => Ok(uid),
+        _ => Err(VaultError::Other(format!(
+            "could not read the user id from `id -u` (exit status {}, output {:?})",
+            output.status,
+            text.trim()
+        ))),
+    }
+}
+
+/// Run `attempt` until it succeeds, pausing `pause` between tries; after `timeout`, return
+/// its last error.
+#[cfg(any(target_os = "macos", test))]
+fn retry_for(
+    timeout: std::time::Duration,
+    pause: std::time::Duration,
+    mut attempt: impl FnMut() -> Result<()>,
+) -> Result<()> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match attempt() {
+            Ok(()) => return Ok(()),
+            Err(err) if std::time::Instant::now() >= deadline => return Err(err),
+            Err(_) => std::thread::sleep(pause),
+        }
+    }
+}
+
+/// `launchctl` arguments that unload the citadel job of user `uid`, then load it from `plist`.
+#[cfg(any(target_os = "macos", test))]
+fn launchd_reload_args(uid: u32, plist: &Path) -> [Vec<String>; 2] {
+    [
+        vec!["bootout".to_string(), launchd_service_target(uid)],
+        vec![
+            "bootstrap".to_string(),
+            format!("gui/{uid}"),
+            plist.to_string_lossy().into_owned(),
+        ],
+    ]
+}
+
+/// `launchctl` service target of the citadel job in the GUI domain of user `uid`.
+#[cfg(any(target_os = "macos", test))]
+fn launchd_service_target(uid: u32) -> String {
+    format!("gui/{uid}/{LAUNCHD_LABEL}")
+}
+
 fn xml_escape(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     for ch in input.chars() {
@@ -258,6 +373,7 @@ fn systemd_escape(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn generates_valid_launchd_plist_and_systemd_unit() {
@@ -296,5 +412,57 @@ mod tests {
         let plist = generate_launchd_plist(bin, data_dir);
         assert!(plist.contains("/opt/a&amp;b/&lt;vault&gt;/citadel"));
         assert!(plist.contains("/tmp/data&amp;&apos;dir&quot;"));
+    }
+
+    #[test]
+    fn launchd_service_target_names_the_job_in_the_users_gui_domain() {
+        assert_eq!(launchd_service_target(501), "gui/501/com.citadel.daemon");
+    }
+
+    #[test]
+    fn retry_for_retries_until_the_attempt_succeeds() {
+        // `launchctl bootstrap` fails (5: Input/output error) while launchd still tears down
+        // the job that `bootout` just stopped.
+        let mut attempts = 0;
+        retry_for(Duration::from_secs(5), Duration::from_millis(1), || {
+            attempts += 1;
+            if attempts < 3 {
+                Err(VaultError::Other(format!("attempt {attempts} failed")))
+            } else {
+                Ok(())
+            }
+        })
+        .expect("the third attempt succeeds");
+        assert_eq!(attempts, 3);
+    }
+
+    #[test]
+    fn retry_for_returns_the_last_error_once_the_time_is_up() {
+        let mut attempts = 0;
+        let err = retry_for(Duration::from_millis(30), Duration::from_millis(5), || {
+            attempts += 1;
+            Err(VaultError::Other(format!("attempt {attempts} failed")))
+        })
+        .expect_err("every attempt fails");
+        assert!(attempts > 1, "retried before giving up");
+        assert_eq!(err.to_string(), format!("attempt {attempts} failed"));
+    }
+
+    #[test]
+    fn launchd_start_reregisters_the_existing_plist() {
+        // After `citadel update` swaps the binary, launchd can refuse to spawn the loaded job
+        // (`EX_CONFIG`, "needs LWCR update") and `kickstart` exits 0 without starting it.
+        // Loading the job again starts the new binary (`RunAtLoad`).
+        let plist = Path::new("/Users/alice/Library/LaunchAgents/com.citadel.daemon.plist");
+        let [bootout, bootstrap] = launchd_reload_args(501, plist);
+        assert_eq!(bootout, ["bootout", "gui/501/com.citadel.daemon"]);
+        assert_eq!(
+            bootstrap,
+            [
+                "bootstrap",
+                "gui/501",
+                "/Users/alice/Library/LaunchAgents/com.citadel.daemon.plist"
+            ]
+        );
     }
 }

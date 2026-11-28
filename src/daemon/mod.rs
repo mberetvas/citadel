@@ -26,7 +26,7 @@ use info::{DaemonInfo, DaemonInfoGuard};
 
 pub use service::{
     generate_launchd_plist, generate_systemd_unit, install_service, service_file_path,
-    uninstall_service, LAUNCHD_LABEL, SYSTEMD_SERVICE_NAME,
+    start_service, uninstall_service, LAUNCHD_LABEL, SYSTEMD_SERVICE_NAME,
 };
 
 /// Default web scheduler tick interval (60 seconds).

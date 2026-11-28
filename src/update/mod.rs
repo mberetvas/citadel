@@ -8,6 +8,7 @@ use flate2::read::GzDecoder;
 
 use crate::config::VaultConfig;
 use crate::daemon::DaemonStatus;
+use crate::doctor::running::ServiceState;
 use crate::error::{Result, VaultError};
 use crate::ingest::normalize::sha256_hex;
 use crate::update::check::{
@@ -317,12 +318,19 @@ pub async fn run_update<W: Write>(opts: UpdateOpts, out: &mut W) -> Result<()> {
 
     // Restart running native daemon if active.
     if let Ok(DaemonStatus::Running(old_pid)) = crate::daemon::daemon_status(&opts.config) {
+        // Decided before the stop: systemd reports a stopped service as inactive.
+        let supervised = service_supervises(
+            &crate::doctor::running::gather_service_state(),
+            &opts.config.data_dir,
+        );
         restart_daemon_after_update(
             out,
             old_pid,
+            supervised,
             || crate::daemon::stop_daemon(&opts.config),
             || daemon_status_after_grace(&opts.config, DAEMON_RELAUNCH_GRACE),
             || crate::daemon::start_daemon_with_exe(&opts.config, &opts.current_exe),
+            || start_service_and_wait(&opts.config),
         )?;
     }
 
@@ -461,9 +469,25 @@ fn write_container_rebuild_steps<W: Write>(
     Ok(())
 }
 
+/// Whether the installed OS service supervises the daemon of the vault at `data_dir`: it is
+/// loaded (so launchd or systemd relaunches it) and its `CITADEL_HOME` is that vault.
+fn service_supervises(state: &ServiceState, data_dir: &Path) -> bool {
+    matches!(
+        state,
+        ServiceState::Installed { file, loaded: true }
+            if file
+                .data_dir
+                .as_deref()
+                .is_some_and(|dir| crate::fsutil::same_path(dir, data_dir))
+    )
+}
+
 /// How long a stopped daemon is given to be relaunched by its service manager (launchd's
 /// `KeepAlive`) before `citadel update` starts the new binary itself.
 const DAEMON_RELAUNCH_GRACE: Duration = Duration::from_secs(1);
+
+/// How long the service manager is given to start the daemon before the update reports failure.
+const SERVICE_START_GRACE: Duration = Duration::from_secs(10);
 
 /// The daemon status as soon as a daemon holds the lock, or once `grace` has passed.
 fn daemon_status_after_grace(config: &VaultConfig, grace: Duration) -> Result<DaemonStatus> {
@@ -477,19 +501,36 @@ fn daemon_status_after_grace(config: &VaultConfig, grace: Duration) -> Result<Da
     }
 }
 
+/// Ask the OS service manager to start the daemon, then wait until it holds the daemon lock.
+fn start_service_and_wait(config: &VaultConfig) -> Result<u32> {
+    crate::daemon::start_service()?;
+    match daemon_status_after_grace(config, SERVICE_START_GRACE)? {
+        DaemonStatus::Running(pid) => Ok(pid),
+        DaemonStatus::Stopped | DaemonStatus::Stale => Err(VaultError::Other(format!(
+            "the service manager did not start the daemon within {} seconds; see {}",
+            SERVICE_START_GRACE.as_secs(),
+            config.log_path().display()
+        ))),
+    }
+}
+
 /// Stop the running daemon (`old_pid`) and start it on the new binary, reporting the outcome to `out`.
 ///
 /// Who holds the daemon lock after the stop decides the next step. Nobody: start the new
-/// binary. Another pid: a service manager already relaunched the daemon, and a second one
-/// would only fight it for the lock. Still `old_pid`: the old daemon has not exited (a
-/// SIGTERMed daemon first finishes its in-flight Syncs), so nothing restarts it and the user
-/// is told how to start it once it has stopped.
+/// binary, through `start_service` when an OS service supervises the daemon (`supervised`),
+/// else with `spawn`. A daemon spawned beside a service leaves launchd or systemd failing on
+/// the lock while it runs unsupervised. Another pid: a service manager already relaunched the
+/// daemon, and a second one would only fight it for the lock. Still `old_pid`: the old daemon
+/// has not exited (a SIGTERMed daemon first finishes its in-flight Syncs), so nothing
+/// restarts it and the user is told how to restart it once it has stopped.
 fn restart_daemon_after_update<W: Write>(
     out: &mut W,
     old_pid: u32,
+    supervised: bool,
     stop: impl FnOnce() -> Result<Option<u32>>,
     status_after_stop: impl FnOnce() -> Result<DaemonStatus>,
-    start: impl FnOnce() -> Result<Option<u32>>,
+    spawn: impl FnOnce() -> Result<Option<u32>>,
+    start_service: impl FnOnce() -> Result<u32>,
 ) -> Result<()> {
     let stop_error = stop().err();
     match status_after_stop() {
@@ -497,12 +538,20 @@ fn restart_daemon_after_update<W: Write>(
             let reason = stop_error
                 .map(|err| format!(" ({err})"))
                 .unwrap_or_default();
+            let next_step = if supervised {
+                "then run `citadel daemon install`, which restarts it through its service on \
+                 the new version."
+                    .to_string()
+            } else {
+                "when `citadel daemon status` reports it stopped, run `citadel daemon start` \
+                 (if it keeps running, run `citadel daemon stop` first)."
+                    .to_string()
+            };
             writeln!(
                 out,
                 "Warning: the daemon has not stopped yet{reason}, so it was not restarted and \
                  still runs the old version. A daemon finishing a Sync exits once the Sync is \
-                 done: when `citadel daemon status` reports it stopped, run \
-                 `citadel daemon start` (if it keeps running, run `citadel daemon stop` first)."
+                 done: {next_step}"
             )?;
         }
         Ok(DaemonStatus::Running(pid)) => writeln!(
@@ -510,7 +559,18 @@ fn restart_daemon_after_update<W: Write>(
             "The daemon is already running again (pid {pid}), most likely relaunched by its \
              service manager, so no second one was started."
         )?,
-        Ok(DaemonStatus::Stopped | DaemonStatus::Stale) => match start() {
+        Ok(DaemonStatus::Stopped | DaemonStatus::Stale) if supervised => match start_service() {
+            Ok(pid) => writeln!(
+                out,
+                "Restarted citadel daemon through its OS service (pid {pid})."
+            )?,
+            Err(err) => writeln!(
+                out,
+                "Warning: could not restart the daemon through its OS service: {err}. Run \
+                 `citadel doctor`; `citadel daemon install` re-registers the service."
+            )?,
+        },
+        Ok(DaemonStatus::Stopped | DaemonStatus::Stale) => match spawn() {
             Ok(Some(pid)) => writeln!(out, "Restarted citadel daemon (pid {pid}).")?,
             Ok(None) => {}
             Err(err) => writeln!(
@@ -518,11 +578,18 @@ fn restart_daemon_after_update<W: Write>(
                 "Warning: failed to restart daemon: {err}. Start it with `citadel daemon start`."
             )?,
         },
-        Err(err) => writeln!(
-            out,
-            "Warning: could not check whether the daemon stopped ({err}), so it was not \
-             restarted. Run `citadel daemon status`, then `citadel daemon start` if it is stopped."
-        )?,
+        Err(err) => {
+            let start_command = if supervised {
+                "citadel daemon install"
+            } else {
+                "citadel daemon start"
+            };
+            writeln!(
+                out,
+                "Warning: could not check whether the daemon stopped ({err}), so it was not \
+                 restarted. Run `citadel daemon status`, then `{start_command}` if it is stopped."
+            )?;
+        }
     }
     Ok(())
 }
@@ -776,12 +843,14 @@ mod tests {
         restart_daemon_after_update(
             &mut out,
             7,
+            false,
             || Err(VaultError::Other(STOP_TIMEOUT.into())),
             || Ok(DaemonStatus::Running(7)),
             || {
                 started = true;
                 Ok(Some(42))
             },
+            || unreachable!("no service supervises this daemon"),
         )
         .expect("restart reporting succeeds");
         let text = String::from_utf8(out).expect("utf8");
@@ -805,27 +874,31 @@ mod tests {
     fn daemon_restart_leaves_a_daemon_relaunched_by_its_service_manager_alone() {
         // launchd (`KeepAlive`) relaunches the job as soon as the old daemon exits, whether or
         // not the stop poll saw the gap in between.
-        for stop_result in [Ok(Some(7)), Err(VaultError::Other(STOP_TIMEOUT.into()))] {
-            let mut out = Vec::new();
-            let mut started = false;
-            restart_daemon_after_update(
-                &mut out,
-                7,
-                move || stop_result,
-                || Ok(DaemonStatus::Running(99)),
-                || {
-                    started = true;
-                    Ok(Some(42))
-                },
-            )
-            .expect("restart reporting succeeds");
-            let text = String::from_utf8(out).expect("utf8");
-            assert!(
-                !started,
-                "a second daemon would fight the relaunched one for the lock"
-            );
-            assert!(text.contains("already running again (pid 99)"), "{text}");
-            assert!(!text.contains("Warning"), "{text}");
+        for supervised in [false, true] {
+            for stop_result in [Ok(Some(7)), Err(VaultError::Other(STOP_TIMEOUT.into()))] {
+                let mut out = Vec::new();
+                let mut started = false;
+                restart_daemon_after_update(
+                    &mut out,
+                    7,
+                    supervised,
+                    move || stop_result,
+                    || Ok(DaemonStatus::Running(99)),
+                    || {
+                        started = true;
+                        Ok(Some(42))
+                    },
+                    || unreachable!("the service manager already relaunched it"),
+                )
+                .expect("restart reporting succeeds");
+                let text = String::from_utf8(out).expect("utf8");
+                assert!(
+                    !started,
+                    "a second daemon would fight the relaunched one for the lock"
+                );
+                assert!(text.contains("already running again (pid 99)"), "{text}");
+                assert!(!text.contains("Warning"), "{text}");
+            }
         }
     }
 
@@ -843,13 +916,205 @@ mod tests {
             restart_daemon_after_update(
                 &mut out,
                 7,
+                false,
                 move || stop_result,
                 move || Ok(status),
                 || Ok(Some(42)),
+                || unreachable!("no service supervises this daemon"),
             )
             .expect("restart reporting succeeds");
             let text = String::from_utf8(out).expect("utf8");
             assert_eq!(text, "Restarted citadel daemon (pid 42).\n");
+        }
+    }
+
+    #[test]
+    fn daemon_restart_uses_the_service_manager_when_a_service_supervises_the_daemon() {
+        // launchd throttles its relaunch (~10 s), so the lock is still free after the grace
+        // period: the update must hand the start to the service manager, not spawn its own copy.
+        for (stop_result, status) in [
+            (Ok(Some(7)), DaemonStatus::Stopped),
+            (
+                Err(VaultError::Other(STOP_TIMEOUT.into())),
+                DaemonStatus::Stale,
+            ),
+        ] {
+            let mut out = Vec::new();
+            let mut spawned = false;
+            let mut service_started = false;
+            restart_daemon_after_update(
+                &mut out,
+                7,
+                true,
+                move || stop_result,
+                move || Ok(status),
+                || {
+                    spawned = true;
+                    Ok(Some(42))
+                },
+                || {
+                    service_started = true;
+                    Ok(43)
+                },
+            )
+            .expect("restart reporting succeeds");
+            let text = String::from_utf8(out).expect("utf8");
+            assert!(
+                !spawned,
+                "a detached daemon would leave the service manager failing on the lock"
+            );
+            assert!(service_started, "{text}");
+            assert_eq!(
+                text,
+                "Restarted citadel daemon through its OS service (pid 43).\n"
+            );
+        }
+    }
+
+    #[test]
+    fn daemon_restart_never_spawns_when_the_service_fails_to_start() {
+        let mut out = Vec::new();
+        let mut spawned = false;
+        restart_daemon_after_update(
+            &mut out,
+            7,
+            true,
+            || Ok(Some(7)),
+            || Ok(DaemonStatus::Stopped),
+            || {
+                spawned = true;
+                Ok(Some(42))
+            },
+            || Err(VaultError::Other("launchctl kickstart failed".into())),
+        )
+        .expect("restart reporting succeeds");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            !spawned,
+            "falling back to a detached daemon recreates the unsupervised daemon"
+        );
+        assert!(text.starts_with("Warning:"), "{text}");
+        assert!(text.contains("launchctl kickstart failed"), "{text}");
+        assert!(text.contains("`citadel daemon install`"), "{text}");
+    }
+
+    #[test]
+    fn daemon_restart_points_a_supervised_daemon_still_syncing_at_its_service() {
+        let mut out = Vec::new();
+        let mut spawned = false;
+        let mut service_started = false;
+        restart_daemon_after_update(
+            &mut out,
+            7,
+            true,
+            || Err(VaultError::Other(STOP_TIMEOUT.into())),
+            || Ok(DaemonStatus::Running(7)),
+            || {
+                spawned = true;
+                Ok(Some(42))
+            },
+            || {
+                service_started = true;
+                Ok(43)
+            },
+        )
+        .expect("restart reporting succeeds");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            !spawned && !service_started,
+            "must not try to start while the old daemon is still running"
+        );
+        assert!(text.contains("has not stopped yet"), "{text}");
+        assert!(
+            text.contains("`citadel daemon install`"),
+            "re-registering starts the new binary even when launchd refuses to spawn it: {text}"
+        );
+        assert!(
+            !text.contains("`citadel daemon start`"),
+            "a plain start would run a daemon outside the service: {text}"
+        );
+    }
+
+    #[test]
+    fn daemon_restart_status_error_points_a_supervised_daemon_at_its_service() {
+        let mut out = Vec::new();
+        restart_daemon_after_update(
+            &mut out,
+            7,
+            true,
+            || Ok(Some(7)),
+            || Err(VaultError::Other("permission denied".into())),
+            || unreachable!("the daemon state is unknown"),
+            || unreachable!("the daemon state is unknown"),
+        )
+        .expect("restart reporting succeeds");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(text.contains("permission denied"), "{text}");
+        assert!(
+            text.contains("`citadel daemon install`"),
+            "re-registering starts the new binary even when launchd refuses to spawn it: {text}"
+        );
+        assert!(
+            !text.contains("`citadel daemon start`"),
+            "a plain start would run a daemon outside the service: {text}"
+        );
+    }
+
+    /// An installed service whose file sets `CITADEL_HOME` to `data_dir`.
+    fn installed_service(data_dir: Option<&Path>, loaded: bool) -> ServiceState {
+        ServiceState::Installed {
+            file: crate::doctor::running::ServiceFile {
+                path: PathBuf::from("/Library/LaunchAgents/com.citadel.daemon.plist"),
+                binary: Some(PathBuf::from("/usr/local/bin/citadel")),
+                data_dir: data_dir.map(Path::to_path_buf),
+                unreadable: None,
+            },
+            loaded,
+        }
+    }
+
+    #[test]
+    fn only_a_loaded_service_for_this_vault_supervises_its_daemon() {
+        let dir = tempdir().expect("tempdir");
+        let vault = dir.path().join("vault");
+        let other = dir.path().join("other");
+        std::fs::create_dir_all(&vault).expect("mkdir vault");
+        std::fs::create_dir_all(&other).expect("mkdir other");
+
+        assert!(service_supervises(
+            &installed_service(Some(&vault), true),
+            &vault
+        ));
+        assert!(
+            !service_supervises(&installed_service(Some(&vault), false), &vault),
+            "an unloaded service relaunches nothing"
+        );
+        assert!(
+            !service_supervises(&installed_service(Some(&other), true), &vault),
+            "a service for another vault must not be restarted instead"
+        );
+        assert!(
+            !service_supervises(&installed_service(None, true), &vault),
+            "an unreadable service file names no vault"
+        );
+        for state in [
+            ServiceState::NotInstalled,
+            ServiceState::Unsupported,
+            ServiceState::Unknown {
+                reason: "HOME is not set".into(),
+            },
+        ] {
+            assert!(!service_supervises(&state, &vault), "{state:?}");
+        }
+
+        #[cfg(unix)]
+        {
+            let link = dir.path().join("vault-link");
+            std::os::unix::fs::symlink(&vault, &link).expect("symlink");
+            assert!(
+                service_supervises(&installed_service(Some(&vault), true), &link),
+                "the same vault reached through a symlink"
+            );
         }
     }
 
