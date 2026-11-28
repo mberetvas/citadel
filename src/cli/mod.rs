@@ -493,22 +493,46 @@ fn dispatch_command<W: Write>(
             Ok(())
         }
         Commands::Daemon { command } => match command {
-            DaemonCommands::Start { foreground } => {
-                if let Some(pid) = crate::daemon::start_daemon(&config, foreground)? {
-                    writeln!(
-                        out,
-                        "Started citadel daemon (pid {pid}, log: {}).",
-                        config.log_path().display()
-                    )?;
-                }
+            DaemonCommands::Start { foreground: true } => {
+                crate::daemon::run_daemon(&config)?;
+                Ok(())
+            }
+            DaemonCommands::Start { foreground: false } => {
+                use crate::daemon::supervision::{Started, Supervision};
+                let supervision = Supervision::for_vault(&config, std::env::current_exe()?);
+                let (pid, how) = match supervision.start()? {
+                    Started::Service(pid) => (pid, " through its OS service"),
+                    Started::Spawned(pid) => (pid, ""),
+                };
+                writeln!(
+                    out,
+                    "Started citadel daemon{how} (pid {pid}, log: {}).",
+                    config.log_path().display()
+                )?;
                 Ok(())
             }
             DaemonCommands::Stop => {
-                match crate::daemon::stop_daemon(&config)? {
-                    Some(pid) => writeln!(out, "Stopped citadel daemon (pid {pid}).")?,
-                    None => writeln!(out, "Daemon is not running.")?,
-                }
-                Ok(())
+                use crate::daemon::supervision::{Supervision, Wait};
+                let supervision = Supervision::for_vault(&config, std::env::current_exe()?);
+                let interrupted = ctrl_c_flag();
+                let mut last_line: Option<std::time::Instant> = None;
+                let stopped = supervision.stop(&mut |draining| {
+                    if interrupted.load(std::sync::atomic::Ordering::SeqCst) {
+                        return Wait::Abort;
+                    }
+                    let due = last_line.map_or(draining.waited >= WAIT_LINE_AFTER, |at| {
+                        at.elapsed() >= WAIT_LINE_EVERY
+                    });
+                    if due {
+                        let sources = syncing_sources(&config, draining.pid);
+                        // Best effort: a broken pipe must not end the wait.
+                        let _ = writeln!(out, "{}", waiting_line(&sources, draining));
+                        let _ = out.flush();
+                        last_line = Some(std::time::Instant::now());
+                    }
+                    Wait::Continue
+                })?;
+                report_stopped(out, stopped)
             }
             DaemonCommands::Status => {
                 match crate::daemon::daemon_status(&config)? {
@@ -965,12 +989,183 @@ fn write_csv_row<'a, W: Write, I: Iterator<Item = &'a str>>(
     writeln!(out)
 }
 
+/// How long `citadel daemon stop` waits quietly before it says what it waits for.
+const WAIT_LINE_AFTER: std::time::Duration = std::time::Duration::from_secs(1);
+/// How often it says it again.
+const WAIT_LINE_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Set once the user presses Ctrl-C. While it is watched, Ctrl-C no longer ends the process.
+fn ctrl_c_flag() -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+    let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let set = std::sync::Arc::clone(&flag);
+    std::thread::spawn(move || {
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
+            return;
+        };
+        if rt.block_on(tokio::signal::ctrl_c()).is_ok() {
+            set.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    });
+    flag
+}
+
+/// Names of the Sources whose Sync claim daemon `pid` holds; empty if the vault cannot be read.
+fn syncing_sources(config: &VaultConfig, pid: u32) -> Vec<String> {
+    let path = config.db_path();
+    if !path.exists() {
+        return Vec::new();
+    }
+    let Ok(conn) = rusqlite::Connection::open_with_flags(
+        &path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) else {
+        return Vec::new();
+    };
+    let names = conn
+        .prepare(
+            "SELECT s.name FROM sync_claims c JOIN sources s ON s.id = c.source_id \
+             WHERE c.pid = ?1 ORDER BY s.name",
+        )
+        .and_then(|mut stmt| {
+            stmt.query_map([pid], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<String>>>()
+        });
+    names.unwrap_or_default()
+}
+
+/// The line `citadel daemon stop` prints while the daemon finishes its Syncs.
+fn waiting_line(sources: &[String], draining: &crate::daemon::supervision::Draining) -> String {
+    let what = match sources {
+        [] => format!("the daemon (pid {}) to exit", draining.pid),
+        [one] => format!("{one} to finish its Sync"),
+        many => format!("{} to finish their Syncs", many.join(", ")),
+    };
+    format!(
+        "Waiting for {what} ({}s so far; Ctrl-C to stop waiting)...",
+        draining.waited.as_secs()
+    )
+}
+
+/// A failure the command has already explained on its output: the process exits 1 and
+/// prints nothing more.
+#[derive(Debug)]
+pub struct SilentExit;
+
+impl std::fmt::Display for SilentExit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("command did not finish (explained above)")
+    }
+}
+
+impl std::error::Error for SilentExit {}
+
+/// Print the outcome of `citadel daemon stop`.
+fn report_stopped<W: Write>(
+    out: &mut W,
+    stopped: crate::daemon::supervision::Stopped,
+) -> anyhow::Result<()> {
+    use crate::daemon::supervision::Stopped;
+    match stopped {
+        Stopped::Stopped(pid) => writeln!(out, "Stopped citadel daemon (pid {pid}).")?,
+        Stopped::Relaunched { pid, by } => writeln!(
+            out,
+            "Stopped citadel daemon (pid {pid}), but another daemon took over at once \
+             (pid {by}), most likely relaunched by a service manager."
+        )?,
+        Stopped::NotRunning => writeln!(out, "Daemon is not running.")?,
+        Stopped::StillDraining { pid, supervised } => {
+            writeln!(out, "{}", still_draining_message(pid, supervised))?;
+            // Not stopped: fail, so `citadel daemon stop && citadel daemon start` does not run a
+            // start the still-running daemon would refuse. The message above says it all.
+            return Err(SilentExit.into());
+        }
+    }
+    Ok(())
+}
+
+/// What a `citadel daemon stop` left behind when the user stopped waiting.
+fn still_draining_message(pid: u32, supervised: bool) -> String {
+    let after = if supervised {
+        "Its OS service is still running and relaunches it then: run `citadel daemon stop` \
+         again to stop it for good."
+    } else {
+        "Nothing restarts it."
+    };
+    format!(
+        "Stopped waiting. The daemon (pid {pid}) got SIGTERM and is still finishing its Sync; \
+         it exits once the Sync is done. {after}"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::db::QueryResult;
     use crate::ingest::SourceSummary;
     use tempfile::tempdir;
+
+    #[test]
+    fn daemon_stop_names_the_sources_it_waits_for() {
+        let dir = tempdir().expect("tempdir");
+        let config = VaultConfig::new(dir.path());
+        assert!(syncing_sources(&config, 7).is_empty(), "no vault.db yet");
+        let conn = crate::db::open_rw_db(&config.db_path()).expect("db");
+        for (id, name) in [(1, "dlthub"), (2, "duckdb"), (3, "other")] {
+            conn.execute(
+                "INSERT INTO sources (id, name, kind, origin) VALUES (?1, ?2, 'web', ?3)",
+                rusqlite::params![id, name, format!("https://{name}.example.com")],
+            )
+            .expect("source");
+        }
+        for (source, pid) in [(2, 7), (1, 7), (3, 8)] {
+            conn.execute(
+                "INSERT INTO sync_claims (source_id, pid, instance_token, claimed_at) \
+                 VALUES (?1, ?2, 't', '2026-11-28T10:00:00Z')",
+                rusqlite::params![source, pid],
+            )
+            .expect("claim");
+        }
+        assert_eq!(syncing_sources(&config, 7), ["dlthub", "duckdb"]);
+
+        let draining = crate::daemon::supervision::Draining {
+            pid: 7,
+            waited: std::time::Duration::from_secs(12),
+        };
+        assert_eq!(
+            waiting_line(&["dlthub".to_string()], &draining),
+            "Waiting for dlthub to finish its Sync (12s so far; Ctrl-C to stop waiting)..."
+        );
+        assert!(waiting_line(&[], &draining).starts_with("Waiting for the daemon (pid 7) to exit"));
+    }
+
+    #[test]
+    fn daemon_stop_says_how_to_finish_after_ctrl_c() {
+        use crate::daemon::supervision::Stopped;
+        for supervised in [true, false] {
+            let mut out = Vec::new();
+            let result = report_stopped(&mut out, Stopped::StillDraining { pid: 7, supervised });
+            let text = String::from_utf8(out).expect("utf8");
+            // The stop did not finish: exit non-zero, so `stop && start` does not run a start
+            // the still-running daemon would refuse.
+            let err = result.expect_err("an unfinished stop fails");
+            assert!(err.is::<SilentExit>(), "nothing more is printed: {err}");
+            assert_eq!(text.matches("Stopped waiting.").count(), 1, "{text}");
+            assert!(
+                text.contains("pid 7") && text.contains("still finishing"),
+                "{text}"
+            );
+            if supervised {
+                assert!(text.contains("run `citadel daemon stop` again"), "{text}");
+            } else {
+                assert!(text.contains("Nothing restarts it."), "{text}");
+            }
+        }
+        let mut out = Vec::new();
+        report_stopped(&mut out, Stopped::Stopped(7)).expect("a finished stop succeeds");
+    }
 
     fn run_args(vault_dir: &std::path::Path, args: &[&str]) -> anyhow::Result<String> {
         let vault_str = vault_dir.to_string_lossy().into_owned();

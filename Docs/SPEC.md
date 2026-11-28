@@ -127,7 +127,10 @@ src/
     prompt.rs        # Schema & SQL recipe description embedded in tool specs
   daemon/
     mod.rs           # Periodic refresh scheduler + notify folder watcher
-    service.rs       # launchd plist & systemd --user unit generator
+    service.rs       # launchd plist & systemd --user unit generator; the launchd and systemd
+                     # adapters (inspect, start = reload, stop) and install/uninstall
+    supervision.rs   # Daemon supervision: whether this vault's service runs the daemon; start,
+                     # stop and restart through it, else a detached process; the restart hint
   ui/
     mod.rs           # Axum router, localhost binding, Origin guard
     api.rs           # JSON REST endpoints for the UI
@@ -449,10 +452,10 @@ citadel
   mcp                             # start stdio MCP server (native / container exec)
   ui [--port <port>] [--no-open]  # launch embedded local Web UI (native)
   daemon
-    start [--foreground]
-    stop
+    start [--foreground]          # through this vault's OS service when installed, else detached
+    stop                          # waits for in-flight Syncs, then stops this vault's OS service
     status
-    install                       # write & load launchd (macOS) / systemd --user (Linux)
+    install                       # write & (re)load launchd (macOS) / systemd --user (Linux)
     uninstall
   skill
     install [--path <dir>] [--global] [--target <agents|claude|copilot|opencode|all>] [--force]
@@ -466,8 +469,8 @@ citadel
 
 ### Health Report (`citadel doctor`)
 One read-only report in four sections. It never writes a file, creates the data directory, opens `vault.db` or starts a process, and it skips the automatic update notice. Design: [doctor-command](./superpowers/specs/2026-11-25-doctor-command-design.md).
-- **Version:** CLI against the latest release (live check with a 3 s timeout, else `update-check.json`; `CITADEL_NO_UPDATE_CHECK=1` uses the cache only); the daemon's version and binary from `daemon.json` against the CLI; the `serve` version (MCP `initialize`) against the CLI.
-- **Running:** daemon state, OS service (installed, loaded, data dir and binary match the CLI), count of `daemon`/`serve` processes, and whether `serve` answers on `127.0.0.1:4317`. Inside a container it skips the daemon, service and process rows.
+- **Version:** CLI against the latest release (live check with a 3 s timeout, else `update-check.json`; `CITADEL_NO_UPDATE_CHECK=1` uses the cache only); the daemon's version and binary from `daemon.json` against the CLI (hint: `citadel daemon stop && citadel daemon start`, never `launchctl kickstart`, which starts nothing after a binary swap); the `serve` version (MCP `initialize`) against the CLI.
+- **Running:** daemon state, OS service (installed, loaded — launchd: job loaded, systemd: unit active; a not-loaded service, as `citadel daemon stop` leaves it, is `·` with hint `citadel daemon start` (`citadel daemon stop && citadel daemon start` while a daemon already holds the lock), or `citadel daemon install` when its file names another data dir — data dir and binary match the CLI), count of `daemon`/`serve` processes, and whether `serve` answers on `127.0.0.1:4317`. Inside a container it skips the daemon, service and process rows.
 - **Setup:** for Claude Code, Antigravity and Codex, in local (current directory) and global (home) scope: the skill (present, dangling, outdated) and the `citadel` MCP entry (stdio command resolves, HTTP URL answers). It runs `--version` only on a stdio command that is the bare name `citadel` found in an absolute `PATH` directory, or an absolute path named `citadel`; any other resolved command is `·` "version not checked", a relative path is `·` "relative command, not checked", and neither is run. Local scope is skipped when the current directory is the home directory.
 - **Data:** the data directory path, marked `(not created yet)` when absent.
 
@@ -520,7 +523,7 @@ Running `citadel setup` in an interactive TTY launches a guided `cliclack` wizar
 #### `citadel update` Execution
 1. **Container detection:** If running inside an OCI container (`/.dockerenv`, `/run/.containerenv`, or `CITADEL_CONTAINER=1`; Apple `container` creates neither marker file, so `make run` and the documented `container run` command set `CITADEL_CONTAINER=1`), do **not** mutate the container binary. Instead print the current and latest version (a short live check, falling back to `update-check.json`) and, unless already up to date, the exact steps to check out the release source (`git fetch --tags && git checkout vX.Y.Z`), rebuild the image and recreate the container with Apple `container` (or `make build && make run`).
 2. **Version check:** Query the GitHub Releases latest endpoint and compare with `env!("CARGO_PKG_VERSION")` using `semver`. With `--check`, print status and exit without modifying the binary.
-3. **Atomic native upgrade:** Download the platform tarball and `checksums.sha256` into a temp file in the executable's directory, verify the SHA-256 digest before extracting, atomically replace the running binary (preserving permissions and rolling back on failure), and if a native daemon is running (`daemon.pid`), restart it cleanly: stop it, then start the new binary through its OS service when a loaded service supervises this data dir (reload the launchd job with `launchctl bootout` + `bootstrap`, since launchd can refuse to spawn a job whose binary was replaced and `kickstart` then starts nothing; `systemctl --user start` on Linux), never by spawning a daemon beside it (launchd or systemd would keep failing on the lock); otherwise spawn it. Leave a daemon its service manager already relaunched alone, and report one still finishing a Sync (it exits on its own) instead of restarting it.
+3. **Atomic native upgrade:** Download the platform tarball and `checksums.sha256` into a temp file in the executable's directory, verify the SHA-256 digest before extracting, atomically replace the running binary (preserving permissions and rolling back on failure), and if a native daemon is running (`daemon.pid`), restart it cleanly through daemon supervision (`src/daemon/supervision.rs`): stop it as `citadel daemon stop` does, then start the new binary as `citadel daemon start` does. For a supervised daemon that means stopping its service, then reloading it (`launchctl bootout` + `enable` + `bootstrap`, since launchd can refuse to spawn a job whose binary was replaced and `kickstart` then starts nothing; `systemctl --user start` on Linux), never spawning a daemon beside it (launchd or systemd would keep failing on the lock). Leave a daemon something else already relaunched alone (an unsupervised restart first waits 1 s for a service manager it does not recognise as this vault's, such as one whose plist names no vault, to relaunch the daemon), and report one still finishing a Sync after 5 s (it exits on its own; its service, if any, is left running) instead of restarting it; an unsupervised daemon that exits just after those 5 s still gets the 1 s wait before a new one is spawned: unlike `citadel daemon stop`, an update does not wait out a long Sync.
 
 #### Automatic Update Awareness (`update-check.json`)
 - Stored at `<CITADEL_HOME>/update-check.json` with `{ "checked_at": "<ISO-8601>", "latest_version": "<semver>", "release_url": "<url>" }` and a **24-hour TTL**.
@@ -600,8 +603,9 @@ The `Makefile` drives Docker by default (`RUNTIME ?= docker`); Apple's macOS OCI
 - **Windows:** not yet tested and no prebuilt binary; install with `cargo install --git https://github.com/MaximeBeretvas/citadel --locked` or build from source. `citadel update` and `citadel daemon install` are unsupported there.
 - **PID & single-instance lock:** Acquires an advisory file lock on `daemon.pid` so only one daemon runs per `CITADEL_HOME`.
 - **OS service integration (`citadel daemon install`):**
-  - **macOS:** Generates `~/Library/LaunchAgents/com.citadel.daemon.plist` (`KeepAlive`, `RunAtLoad`) and loads via `launchctl`.
-  - **Linux:** Generates `~/.config/systemd/user/citadel.service` and enables via `systemctl --user`.
+  - **macOS:** Generates `~/Library/LaunchAgents/com.citadel.daemon.plist` (`KeepAlive`, `RunAtLoad`) and reloads it: `launchctl bootout`, `enable`, then `bootstrap` retried for 10 s while launchd tears the old instance down. A failed load is an error (the legacy `load -w` exits 0 when it prints "Load failed").
+  - **Linux:** Generates `~/.config/systemd/user/citadel.service`, then `systemctl --user daemon-reload`, `enable` and `restart` (so a changed unit or binary takes effect).
+- **Daemon supervision:** A daemon is supervised when this vault's service file exists and its `CITADEL_HOME` is this vault, whether or not the manager has it loaded right now; another vault's job never counts. `citadel daemon start` then starts the service (launchd: the reload above; systemd: `start`) and waits up to 10 s for the daemon lock, instead of spawning a detached daemon; when the service cannot start (no user bus, no `gui/<uid>` domain over SSH) it fails and names `citadel daemon start --foreground` as the way to run without it. Deciding supervision reads only the service file; it does not ask the manager. `citadel daemon stop` drains first and stops for good: it sends `SIGTERM` (the daemon stops starting new Syncs and finishes the ones it runs) and waits, with no time limit, for the daemon to exit, printing after 1 s and every 10 s which Source it waits for (`Waiting for <Source> to finish its Sync (12s so far; Ctrl-C to stop waiting)...`, from `sync_claims`). Once the daemon has exited it stops a supervised daemon's service (launchd: `bootout`, so `KeepAlive` does not relaunch it until `daemon start` or the next login; systemd: `stop`), which also ends a daemon `KeepAlive` relaunched in between while it is still idle. Stopping the service first would have launchd (`ExitTimeOut`, 20 s by default) or systemd (`TimeoutStopSec`, 90 s) SIGKILL a daemon still finishing a Sync, losing the crawl; the generated plist and unit set neither, drain-first replaces them. Ctrl-C while waiting stops only the wait: nothing is killed, the daemon finishes its Sync and exits, a supervised daemon's service is left running (so it relaunches the daemon), and the CLI says so and to run `citadel daemon stop` again, then exits 1 with no further error text (the stop did not finish, so `citadel daemon stop && citadel daemon start` does not run a start the still-running daemon would refuse). This needs no change to installed plists or units. A stop that sees the lock taken by another pid reports the relaunch instead of a timeout; a stop that finds the lock held before the daemon wrote its pid waits for the pid.
 
 ### 8.3 Shared Scheduler & Watcher Behavior (Container & Native)
 - **Web scheduler loop:** Ticks every 60 seconds; selects `web` sources where `refresh_interval_secs > 0` and `last_synced_at + refresh_interval_secs <= now`; runs up to 2 source syncs concurrently with small random jitter (0–30s). The "starting scheduled web sync" line carries `source=` and `origin=`. After each Sync's complete line (scheduled web Syncs and local-folder watcher re-indexes), the daemon logs each Sync warning at `warn`, one line per warning starting with the Source name.

@@ -39,6 +39,12 @@ _Avoid_: lock, lease, in-flight
 **Cut-off Sync**:
 A Sync whose first crawl used up the page budget (`max_pages`), or that collected as many distinct storable pages as the budget, or recorded as many results. A result is a stored Page, an Error page, or a copy merged into another Page (a Markdown twin or Canonical duplicate). Pages count whether or not they were stored.
 
+### Daemon
+
+**Supervised daemon**:
+The daemon of a vault whose OS service (launchd job or systemd unit) names that vault; it is started, stopped and restarted through that service, never as a detached process beside it.
+_Avoid_: managed daemon, service mode
+
 ### Pages
 
 **Page**:

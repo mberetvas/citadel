@@ -1,11 +1,11 @@
 pub mod info;
 pub mod service;
+pub mod supervision;
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -23,8 +23,8 @@ use crate::sources::{SourceLifecycle, SyncOutcome};
 use info::{DaemonInfo, DaemonInfoGuard};
 
 pub use service::{
-    generate_launchd_plist, generate_systemd_unit, install_service, service_file_path,
-    start_service, uninstall_service, LAUNCHD_LABEL, SYSTEMD_SERVICE_NAME,
+    generate_launchd_plist, generate_systemd_unit, install_service, uninstall_service,
+    LAUNCHD_LABEL, SYSTEMD_SERVICE_NAME,
 };
 
 /// Default web scheduler tick interval (60 seconds).
@@ -161,107 +161,17 @@ fn write_daemon_info_best_effort(path: &Path) -> Option<DaemonInfoGuard> {
     }
 }
 
-/// Start the daemon either in the foreground (blocking until `SIGINT`/`SIGTERM`) or detached.
-///
-/// Returns `Ok(Some(child_pid))` when detached, or `Ok(None)` after clean foreground shutdown.
-pub fn start_daemon(config: &VaultConfig, foreground: bool) -> Result<Option<u32>> {
+/// Run the daemon in this process, blocking until `SIGINT`/`SIGTERM`. To start it in the
+/// background, use [`supervision::Supervision::start`].
+pub fn run_daemon(config: &VaultConfig) -> Result<()> {
     config.ensure_data_dir()?;
-
-    if foreground {
-        let _lock = PidLock::acquire(&config.pid_path())?;
-        let _info = write_daemon_info_best_effort(&config.daemon_info_path());
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .map_err(|err| VaultError::Other(format!("failed to build tokio runtime: {err}")))?;
-        rt.block_on(run_daemon_foreground(config.clone()))?;
-        return Ok(None);
-    }
-
-    start_daemon_with_exe(config, &std::env::current_exe()?)
-}
-
-/// Spawn the detached daemon from an explicit executable path (avoids Linux `/proc/self/exe` `(deleted)` paths after self-update).
-pub fn start_daemon_with_exe(config: &VaultConfig, exe: &Path) -> Result<Option<u32>> {
-    if let DaemonStatus::Running(pid) = daemon_status(config)? {
-        return Err(VaultError::AlreadyRunning(format!(
-            "daemon is already running (pid {pid})"
-        )));
-    }
-
-    let log_file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(config.log_path())?;
-    let log_err = log_file.try_clone()?;
-
-    let child = Command::new(exe)
-        .arg("--data-dir")
-        .arg(&config.data_dir)
-        .arg("daemon")
-        .arg("start")
-        .arg("--foreground")
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(log_file))
-        .stderr(Stdio::from(log_err))
-        .spawn()?;
-
-    Ok(Some(child.id()))
-}
-
-/// Stop a running daemon cleanly via `SIGTERM`, or clean up a stale `daemon.pid`.
-///
-/// Returns `Ok(Some(pid))` if a running daemon was stopped, or `Ok(None)` if none was running.
-pub fn stop_daemon(config: &VaultConfig) -> Result<Option<u32>> {
-    match daemon_status(config)? {
-        DaemonStatus::Stopped => Ok(None),
-        DaemonStatus::Stale => {
-            let _ = fs::remove_file(config.pid_path());
-            let _ = fs::remove_file(config.daemon_info_path());
-            Ok(None)
-        }
-        DaemonStatus::Running(pid) => {
-            if pid == 0 {
-                return Err(VaultError::Other(
-                    "daemon lock is held, but daemon.pid does not contain a valid PID".into(),
-                ));
-            }
-
-            send_sigterm(pid)?;
-
-            for _ in 0..50 {
-                if !matches!(daemon_status(config)?, DaemonStatus::Running(_)) {
-                    return Ok(Some(pid));
-                }
-                std::thread::sleep(Duration::from_millis(100));
-            }
-
-            Err(VaultError::Other(format!(
-                "sent SIGTERM to daemon (pid {pid}), but it did not exit within 5 seconds"
-            )))
-        }
-    }
-}
-
-#[cfg(unix)]
-fn send_sigterm(pid: u32) -> Result<()> {
-    let status = Command::new("kill")
-        .arg("-TERM")
-        .arg(pid.to_string())
-        .status()?;
-    if !status.success() {
-        return Err(VaultError::Other(format!(
-            "failed to send SIGTERM to pid {pid} (exit status {status})"
-        )));
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn send_sigterm(pid: u32) -> Result<()> {
-    Err(VaultError::Other(format!(
-        "stopping daemon pid {pid} via signal is not supported on this platform"
-    )))
+    let _lock = PidLock::acquire(&config.pid_path())?;
+    let _info = write_daemon_info_best_effort(&config.daemon_info_path());
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|err| VaultError::Other(format!("failed to build tokio runtime: {err}")))?;
+    rt.block_on(run_daemon_foreground(config.clone()))
 }
 
 /// Run the scheduler and local folder watcher concurrently until `SIGINT` or `SIGTERM`.
@@ -722,6 +632,7 @@ mod tests {
     use crate::db::open_rw_db;
     use crate::error::VaultError;
     use crate::sources::{AddSourceParams, SourceLifecycle};
+    use std::process::Command;
     use tempfile::tempdir;
 
     fn summary_with_warnings(warnings: Vec<String>) -> SyncSummary {
@@ -743,19 +654,6 @@ mod tests {
         assert_eq!(lines.len(), 2);
         assert!(lines[0].starts_with("dlthub") && lines[0].contains("first warning"));
         assert!(lines[1].starts_with("dlthub") && lines[1].contains("second warning"));
-    }
-
-    #[test]
-    fn start_daemon_with_exe_spawns_explicit_executable_path() {
-        let vault_dir = tempdir().expect("vault tempdir");
-        let config = VaultConfig::new(vault_dir.path());
-        let missing_exe = vault_dir.path().join("nonexistent-citadel-bin");
-        let err = start_daemon_with_exe(&config, &missing_exe)
-            .expect_err("nonexistent explicit exe must fail with io NotFound");
-        assert!(
-            matches!(err, VaultError::Io(ref io_err) if io_err.kind() == std::io::ErrorKind::NotFound),
-            "expected NotFound Io error from explicit exe path, got: {err}"
-        );
     }
 
     #[test]

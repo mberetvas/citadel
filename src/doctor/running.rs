@@ -1,34 +1,10 @@
 //! Running checks: daemon state and the OS background service.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use super::report::{Check, Section};
+use crate::daemon::supervision::{ServiceState, RESTART_HINT};
 use crate::daemon::DaemonStatus;
-
-/// Parsed fields of an installed OS service definition.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ServiceFile {
-    pub path: PathBuf,
-    pub binary: Option<PathBuf>,
-    pub data_dir: Option<PathBuf>,
-    /// Why the file could not be read, when it exists but is unreadable.
-    pub unreadable: Option<String>,
-}
-
-/// State of the OS background service.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ServiceState {
-    Unsupported,
-    NotInstalled,
-    /// The service file location could not be determined.
-    Unknown {
-        reason: String,
-    },
-    Installed {
-        file: ServiceFile,
-        loaded: bool,
-    },
-}
 
 /// Map the daemon pid-file status to a check row.
 pub fn daemon_running_check(status: DaemonStatus, pid_path: &Path) -> Check {
@@ -52,150 +28,14 @@ pub fn daemon_running_check(status: DaemonStatus, pid_path: &Path) -> Check {
     }
 }
 
-fn xml_unescape(input: &str) -> String {
-    input
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&apos;", "'")
-        .replace("&amp;", "&")
-}
-
-/// The `<string>` value that follows `<key>{key}</key>`, XML-unescaped.
-fn plist_string_after(text: &str, key: &str) -> Option<String> {
-    let marker = format!("<key>{key}</key>");
-    let rest = &text[text.find(&marker)? + marker.len()..];
-    let rest = &rest[rest.find("<string>")? + "<string>".len()..];
-    let value = &rest[..rest.find("</string>")?];
-    Some(xml_unescape(value))
-}
-
-/// Extract `(binary, CITADEL_HOME)` from a launchd plist.
-pub fn parse_launchd_plist(text: &str) -> (Option<PathBuf>, Option<PathBuf>) {
-    (
-        plist_string_after(text, "ProgramArguments").map(PathBuf::from),
-        plist_string_after(text, "CITADEL_HOME").map(PathBuf::from),
-    )
-}
-
-fn systemd_unescape(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    let mut chars = input.chars();
-    while let Some(c) = chars.next() {
-        if c == '\\' {
-            match chars.next() {
-                Some(next) => out.push(next),
-                None => out.push(c),
-            }
-        } else {
-            out.push(c);
-        }
-    }
-    out
-}
-
-/// First token of an `ExecStart=` value; supports the double-quoted form.
-fn first_exec_token(value: &str) -> String {
-    let value = value.trim();
-    let Some(quoted) = value.strip_prefix('"') else {
-        return value.split_whitespace().next().unwrap_or("").to_string();
-    };
-    let mut raw = String::new();
-    let mut chars = quoted.chars();
-    while let Some(c) = chars.next() {
-        match c {
-            '"' => break,
-            '\\' => {
-                raw.push(c);
-                if let Some(next) = chars.next() {
-                    raw.push(next);
-                }
-            }
-            _ => raw.push(c),
-        }
-    }
-    systemd_unescape(&raw)
-}
-
-/// Extract `(binary, CITADEL_HOME)` from a systemd user unit.
-pub fn parse_systemd_unit(text: &str) -> (Option<PathBuf>, Option<PathBuf>) {
-    let mut binary = None;
-    let mut data_dir = None;
-    for line in text.lines().map(str::trim) {
-        if let Some(value) = line.strip_prefix("ExecStart=") {
-            let token = first_exec_token(value);
-            if !token.is_empty() {
-                binary = Some(PathBuf::from(token));
-            }
-        } else if let Some(value) = line.strip_prefix("Environment=\"CITADEL_HOME=") {
-            if let Some(value) = value.strip_suffix('"') {
-                data_dir = Some(PathBuf::from(systemd_unescape(value)));
-            }
-        }
-    }
-    (binary, data_dir)
-}
-
-/// Read the service file and ask the OS whether the service is loaded. Read-only.
-pub fn gather_service_state() -> ServiceState {
-    let path = match crate::daemon::service_file_path() {
-        Ok(Some(path)) => path,
-        Ok(None) => return ServiceState::Unsupported,
-        Err(e) => {
-            return ServiceState::Unknown {
-                reason: e.to_string(),
-            }
-        }
-    };
-    let (text, unreadable) = match std::fs::read_to_string(&path) {
-        Ok(text) => (text, None),
-        Err(_) if !path.exists() => return ServiceState::NotInstalled,
-        Err(e) => (String::new(), Some(e.to_string())),
-    };
-    let (binary, data_dir) = if cfg!(target_os = "macos") {
-        parse_launchd_plist(&text)
-    } else {
-        parse_systemd_unit(&text)
-    };
-    ServiceState::Installed {
-        file: ServiceFile {
-            path,
-            binary,
-            data_dir,
-            unreadable,
-        },
-        loaded: service_is_loaded(),
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn service_is_loaded() -> bool {
-    std::process::Command::new("launchctl")
-        .args(["list", crate::daemon::LAUNCHD_LABEL])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
-#[cfg(target_os = "linux")]
-fn service_is_loaded() -> bool {
-    std::process::Command::new("systemctl")
-        .args(["--user", "is-active", crate::daemon::SYSTEMD_SERVICE_NAME])
-        .stderr(std::process::Stdio::null())
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "active")
-        .unwrap_or(false)
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn service_is_loaded() -> bool {
-    false
-}
-
 /// Turn the gathered service state into check rows.
-pub fn service_checks(state: &ServiceState, cli_data_dir: &Path, cli_exe: &Path) -> Vec<Check> {
+/// `daemon_running`: a daemon holds this vault's lock.
+pub fn service_checks(
+    state: &ServiceState,
+    cli_data_dir: &Path,
+    cli_exe: &Path,
+    daemon_running: bool,
+) -> Vec<Check> {
     const NAME: &str = "service";
     match state {
         ServiceState::Unsupported => vec![Check::info(
@@ -224,8 +64,24 @@ pub fn service_checks(state: &ServiceState, cli_data_dir: &Path, cli_exe: &Path)
                     format!("installed and loaded ({})", file.path.display()),
                 ));
             } else {
+                // `citadel daemon stop` stops this vault's service (launchd: unloads the job;
+                // systemd: the unit goes inactive); `start` starts it again. For another
+                // vault's service, `start` would spawn a detached daemon instead.
+                let this_vault = file
+                    .data_dir
+                    .as_deref()
+                    .is_some_and(|dir| crate::fsutil::same_path(dir, cli_data_dir));
+                let hint = if this_vault && daemon_running {
+                    // A detached daemon (e.g. one an older citadel spawned beside the
+                    // service) holds the lock, so `start` alone would refuse.
+                    RESTART_HINT
+                } else if this_vault {
+                    "citadel daemon start"
+                } else {
+                    "citadel daemon install"
+                };
                 checks.push(
-                    Check::warn(
+                    Check::info(
                         Section::Running,
                         NAME,
                         format!(
@@ -233,7 +89,7 @@ pub fn service_checks(state: &ServiceState, cli_data_dir: &Path, cli_exe: &Path)
                             file.path.display()
                         ),
                     )
-                    .with_hint("citadel daemon install"),
+                    .with_hint(hint),
                 );
             }
             if let Some(reason) = &file.unreadable {
@@ -420,8 +276,9 @@ pub fn serve_check(url: &str, probe: &ServeProbe, http_entry_points_here: bool) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::daemon::{generate_launchd_plist, generate_systemd_unit};
+    use crate::daemon::supervision::ServiceFile;
     use crate::doctor::report::CheckStatus;
+    use std::path::PathBuf;
 
     fn p(s: &str) -> Option<PathBuf> {
         Some(PathBuf::from(s))
@@ -437,33 +294,6 @@ mod tests {
             },
             loaded,
         }
-    }
-
-    #[test]
-    fn plist_round_trips_through_generator() {
-        let text = generate_launchd_plist(Path::new("/a & b/citadel"), Path::new("/data"));
-        assert_eq!(
-            parse_launchd_plist(&text),
-            (p("/a & b/citadel"), p("/data"))
-        );
-    }
-
-    #[test]
-    fn unit_round_trips_through_generator() {
-        let text = generate_systemd_unit(Path::new("/opt/my citadel/citadel"), Path::new("/data"));
-        assert_eq!(
-            parse_systemd_unit(&text),
-            (p("/opt/my citadel/citadel"), p("/data"))
-        );
-    }
-
-    #[test]
-    fn unit_unquoted_binary_parses() {
-        let text = generate_systemd_unit(Path::new("/usr/bin/citadel"), Path::new("/data"));
-        assert_eq!(
-            parse_systemd_unit(&text),
-            (p("/usr/bin/citadel"), p("/data"))
-        );
     }
 
     #[test]
@@ -492,6 +322,7 @@ mod tests {
             &ServiceState::Unsupported,
             Path::new("/data"),
             Path::new("/bin/c"),
+            false,
         );
         assert_eq!(checks.len(), 1);
         assert_eq!(checks[0].status, CheckStatus::Info);
@@ -504,6 +335,7 @@ mod tests {
             &ServiceState::NotInstalled,
             Path::new("/data"),
             Path::new("/bin/c"),
+            false,
         );
         assert!(!checks.is_empty());
         assert!(checks.iter().all(|c| c.status == CheckStatus::Info));
@@ -515,23 +347,53 @@ mod tests {
             &installed("/bin/c", "/data", true),
             Path::new("/data"),
             Path::new("/bin/c"),
+            false,
         );
         assert!(checks.iter().all(|c| c.status == CheckStatus::Ok));
     }
 
     #[test]
-    fn service_installed_not_loaded_warns() {
+    fn service_installed_not_loaded_is_info_with_start_hint() {
+        // `citadel daemon stop` unloads the job: a normal state, not a warning.
         let checks = service_checks(
             &installed("/bin/c", "/data", false),
             Path::new("/data"),
             Path::new("/bin/c"),
+            false,
         );
-        let warn = checks
+        assert_eq!(checks.len(), 1, "{checks:?}");
+        assert_eq!(checks[0].status, CheckStatus::Info);
+        assert!(checks[0].detail.contains("not loaded"));
+        assert_eq!(checks[0].hint.as_deref(), Some("citadel daemon start"));
+    }
+
+    #[test]
+    fn service_not_loaded_beside_a_running_daemon_hints_restart() {
+        // A detached daemon holds the lock: `citadel daemon start` alone would refuse.
+        let checks = service_checks(
+            &installed("/bin/c", "/data", false),
+            Path::new("/data"),
+            Path::new("/bin/c"),
+            true,
+        );
+        assert_eq!(checks[0].hint.as_deref(), Some(RESTART_HINT), "{checks:?}");
+    }
+
+    #[test]
+    fn service_not_loaded_for_another_vault_hints_install() {
+        // `citadel daemon start` would spawn a detached daemon for this vault and never load
+        // the other vault's service.
+        let checks = service_checks(
+            &installed("/bin/c", "/other", false),
+            Path::new("/data"),
+            Path::new("/bin/c"),
+            false,
+        );
+        let row = checks
             .iter()
-            .find(|c| c.status == CheckStatus::Warn)
-            .expect("a warn row");
-        assert!(warn.detail.contains("not loaded"));
-        assert!(warn.hint.is_some());
+            .find(|c| c.name == "service")
+            .expect("service row");
+        assert_eq!(row.hint.as_deref(), Some("citadel daemon install"));
     }
 
     #[test]
@@ -540,6 +402,7 @@ mod tests {
             &installed("/bin/c", "/other", true),
             Path::new("/data"),
             Path::new("/bin/c"),
+            false,
         );
         let warn = checks
             .iter()
@@ -557,6 +420,7 @@ mod tests {
             &installed("/old/c", "/data", true),
             Path::new("/data"),
             Path::new("/bin/c"),
+            false,
         );
         let warn = checks
             .iter()
@@ -571,7 +435,7 @@ mod tests {
         let state = ServiceState::Unknown {
             reason: "no home directory".to_string(),
         };
-        let checks = service_checks(&state, Path::new("/data"), Path::new("/bin/c"));
+        let checks = service_checks(&state, Path::new("/data"), Path::new("/bin/c"), false);
         assert_eq!(checks.len(), 1);
         assert_eq!(checks[0].status, CheckStatus::Warn);
         assert!(checks[0].detail.contains("no home directory"));
@@ -588,7 +452,7 @@ mod tests {
         file.data_dir = None;
         file.unreadable = Some("permission denied".to_string());
         let state = ServiceState::Installed { file, loaded };
-        let checks = service_checks(&state, Path::new("/data"), Path::new("/bin/c"));
+        let checks = service_checks(&state, Path::new("/data"), Path::new("/bin/c"), false);
         let warn = checks
             .iter()
             .find(|c| c.status == CheckStatus::Warn)

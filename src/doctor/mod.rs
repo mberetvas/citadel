@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use crate::config::VaultConfig;
+use crate::daemon::supervision::Supervision;
 use report::{Check, Report, Section};
 use running::ServeProbe;
 use setup::{McpEntry, SetupLocation};
@@ -65,13 +66,8 @@ pub async fn run_doctor(config: &VaultConfig, opts: &DoctorOpts) -> Report {
     let service = if opts.in_container {
         None
     } else {
-        Some(running::gather_service_state())
+        Some(Supervision::for_vault(config, opts.current_exe.clone()).service())
     };
-    // Only a loaded service can be restarted through launchctl/systemctl.
-    let service_installed = matches!(
-        service,
-        Some(running::ServiceState::Installed { loaded: true, .. })
-    );
     let home_is_cwd = opts
         .home
         .as_deref()
@@ -114,17 +110,18 @@ pub async fn run_doctor(config: &VaultConfig, opts: &DoctorOpts) -> Report {
         .iter()
         .any(|i| i.http_url() == Some(opts.serve_url.as_str()));
 
-    // Daemon state feeds a Version row and a Running row.
-    let (daemon_version_rows, daemon_running_row) = if opts.in_container {
-        (None, None)
+    // Daemon state feeds a Version row, a Running row and the service row's hint.
+    let (daemon_version_rows, daemon_running_row, daemon_running) = if opts.in_container {
+        (None, None, false)
     } else {
-        match version::gather_daemon_facts(config, service_installed) {
+        match version::gather_daemon_facts(config) {
             Ok(facts) => (
                 version::daemon_version_check(current, &facts),
                 Some(running::daemon_running_check(
                     facts.status,
                     &config.pid_path(),
                 )),
+                matches!(facts.status, crate::daemon::DaemonStatus::Running(_)),
             ),
             Err(err) => (
                 None,
@@ -139,6 +136,7 @@ pub async fn run_doctor(config: &VaultConfig, opts: &DoctorOpts) -> Report {
                         config.pid_path().display()
                     )),
                 ),
+                false,
             ),
         }
     };
@@ -155,6 +153,7 @@ pub async fn run_doctor(config: &VaultConfig, opts: &DoctorOpts) -> Report {
             service,
             &config.data_dir,
             &opts.current_exe,
+            daemon_running,
         ));
         checks.push(running::process_check(&running::gather_processes()));
     } else {
