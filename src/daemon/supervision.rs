@@ -229,8 +229,9 @@ impl Supervision {
                 // names no vault, a moved vault) may still relaunch the daemon: give it a
                 // moment before a spawned daemon would fight it for the lock, also when the
                 // daemon exited just after the stop timed out. A supervised daemon is
-                // started again by reloading its service, which also replaces a daemon the
-                // service relaunched.
+                // started again by reloading its service, whose `bootout` also ends a daemon
+                // the service relaunched after this check (one that relaunched before it is
+                // reported by `start_as` as already running).
                 if !supervised {
                     match self.relaunched_within(self.relaunch_grace) {
                         Ok(Some(pid)) => return Restart::Relaunched(pid),
