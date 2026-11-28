@@ -599,8 +599,11 @@ async fn local_source(lifecycle: &SourceLifecycle, name: &str) -> tempfile::Temp
     docs
 }
 
-/// Drop a `sync` caller while the Sync is paused at `stage`, then let it go on.
-async fn drop_sync_caller_at(stage: Stage) -> (VaultConfig, SourceLifecycle, tempfile::TempDir) {
+/// Drop a `sync` caller while the Sync is paused at `stage`, then let it go on. Returns the
+/// vault and docs dirs so they live as long as the caller's assertions.
+async fn drop_sync_caller_at(
+    stage: Stage,
+) -> (VaultConfig, SourceLifecycle, [tempfile::TempDir; 2]) {
     let vault_dir = tempdir().expect("vault tempdir");
     let config = VaultConfig::new(vault_dir.path());
     let plain = SourceLifecycle::new(config.clone());
@@ -612,13 +615,12 @@ async fn drop_sync_caller_at(stage: Stage) -> (VaultConfig, SourceLifecycle, tem
     caller.abort();
     assert!(caller.await.expect_err("aborted").is_cancelled());
     gate.open();
-    std::mem::forget(vault_dir); // keep the vault for the caller's assertions
-    (config, plain, docs)
+    (config, plain, [vault_dir, docs])
 }
 
 #[tokio::test]
 async fn sync_caller_dropped_after_claim_commits_neither_cancels_nor_leaks() {
-    let (config, lifecycle, _docs) = drop_sync_caller_at(Stage::Claimed).await;
+    let (config, lifecycle, _dirs) = drop_sync_caller_at(Stage::Claimed).await;
     assert_eq!(
         wait_for_status(&config, "docs", "ok").await,
         "ok",
@@ -644,7 +646,7 @@ async fn sync_caller_dropped_after_claim_commits_neither_cancels_nor_leaks() {
 
 #[tokio::test]
 async fn sync_caller_dropped_while_loading_still_syncs() {
-    let (config, _lifecycle, _docs) = drop_sync_caller_at(Stage::Loaded).await;
+    let (config, _lifecycle, _dirs) = drop_sync_caller_at(Stage::Loaded).await;
     assert_eq!(
         wait_for_status(&config, "docs", "ok").await,
         "ok",
