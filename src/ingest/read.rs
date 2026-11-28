@@ -4,13 +4,14 @@
 //! Missing-vault rule: a read never creates the vault. A missing vault reads as an
 //! empty vault: lists are empty, and a lookup by name or id is `NotFound`.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use rusqlite::{params_from_iter, Connection, OpenFlags, OptionalExtension, Row, ToSql};
+use rusqlite::{params_from_iter, Connection, ErrorCode, OpenFlags, OptionalExtension, Row, ToSql};
 use serde::{Deserialize, Serialize};
 
 use super::{SourceDetail, SourceKind, SourceRecord, SourceSummary, SyncRunRecord};
 use crate::config::VaultConfig;
+use crate::db::DEFAULT_QUERY_TIMEOUT_MS;
 use crate::error::{Result, VaultError};
 
 /// One row of a Page list: a Page's metadata without its content.
@@ -109,10 +110,7 @@ const PAGE_LIST_FILTER: &str = "(?1 IS NULL OR p.source_id = ?1)
 /// by URI. The term cannot fail to parse, so every SQLite error is a real one and is
 /// returned.
 pub fn list_pages(config: &VaultConfig, query: &PageQuery) -> Result<Vec<PageListItem>> {
-    match open_vault_for_read(config)? {
-        Some(conn) => query_pages(&conn, query),
-        None => Ok(Vec::new()),
-    }
+    read_vault(config, || Ok(Vec::new()), |conn| query_pages(conn, query))
 }
 
 fn query_pages(conn: &Connection, query: &PageQuery) -> Result<Vec<PageListItem>> {
@@ -202,9 +200,10 @@ fn map_page_list_item(row: &Row<'_>) -> rusqlite::Result<PageListItem> {
 
 /// List all Sources with live Page and word counts from `v_sources`, by name.
 pub fn list_sources(config: &VaultConfig) -> Result<Vec<SourceSummary>> {
-    let Some(conn) = open_vault_for_read(config)? else {
-        return Ok(Vec::new());
-    };
+    read_vault(config, || Ok(Vec::new()), select_source_summaries)
+}
+
+fn select_source_summaries(conn: &Connection) -> Result<Vec<SourceSummary>> {
     let sql = format!(
         "SELECT {SOURCE_COLUMNS}, active_pages, stale_pages, error_pages, total_words
          FROM v_sources ORDER BY name ASC"
@@ -219,7 +218,15 @@ pub fn list_sources(config: &VaultConfig) -> Result<Vec<SourceSummary>> {
 /// One Source by name, with its last 10 Sync runs and its Stale and Error pages.
 pub fn show_source(config: &VaultConfig, name: &str) -> Result<SourceDetail> {
     let not_found = || VaultError::NotFound(format!("source '{name}' not found"));
-    let conn = open_vault_for_read(config)?.ok_or_else(not_found)?;
+    read_vault(
+        config,
+        || Err(not_found()),
+        |conn| select_source_detail(conn, name),
+    )
+}
+
+fn select_source_detail(conn: &Connection, name: &str) -> Result<SourceDetail> {
+    let not_found = || VaultError::NotFound(format!("source '{name}' not found"));
     let sql = format!(
         "SELECT {SOURCE_COLUMNS}, active_pages, stale_pages, error_pages, total_words
          FROM v_sources WHERE name = ?1"
@@ -256,7 +263,7 @@ pub fn show_source(config: &VaultConfig, name: &str) -> Result<SourceDetail> {
         .collect::<rusqlite::Result<Vec<_>>>()?;
 
     let issue_pages = query_pages(
-        &conn,
+        conn,
         &PageQuery {
             source_id: Some(source.id),
             statuses: PageStatuses::STALE_OR_ERROR,
@@ -273,32 +280,38 @@ pub fn show_source(config: &VaultConfig, name: &str) -> Result<SourceDetail> {
 
 /// One Source by id (when `key` is an integer that names one) or else by name.
 pub fn find_source(config: &VaultConfig, key: &str) -> Result<SourceRecord> {
-    let conn = open_vault_for_read(config)?
-        .ok_or_else(|| VaultError::NotFound(format!("source '{key}' not found")))?;
-    if let Ok(id) = key.parse::<i64>() {
-        if let Some(found) = select_one_source(&conn, "id = ?1", id)? {
-            return Ok(found);
-        }
-    }
-    select_one_source(&conn, "name = ?1", key)?
-        .ok_or_else(|| VaultError::NotFound(format!("source '{key}' not found")))
+    let not_found = || VaultError::NotFound(format!("source '{key}' not found"));
+    read_vault(
+        config,
+        || Err(not_found()),
+        |conn| {
+            if let Ok(id) = key.parse::<i64>() {
+                if let Some(found) = select_one_source(conn, "id = ?1", id)? {
+                    return Ok(found);
+                }
+            }
+            select_one_source(conn, "name = ?1", key)?.ok_or_else(not_found)
+        },
+    )
 }
 
 /// Every Source, by name.
 pub fn all_sources(config: &VaultConfig) -> Result<Vec<SourceRecord>> {
-    match open_vault_for_read(config)? {
-        Some(conn) => load_all_sources(&conn),
-        None => Ok(Vec::new()),
-    }
+    read_vault(config, || Ok(Vec::new()), load_all_sources)
 }
 
 /// Web Sources due for refresh at `now_epoch_secs` (UTC Unix seconds), longest-waiting
 /// first. A Source is due once `refresh_interval_secs` has passed since its last Sync
 /// attempt, successful or not; an interval of 0 means manual only.
 pub fn due_web_sources(config: &VaultConfig, now_epoch_secs: i64) -> Result<Vec<SourceRecord>> {
-    let Some(conn) = open_vault_for_read(config)? else {
-        return Ok(Vec::new());
-    };
+    read_vault(
+        config,
+        || Ok(Vec::new()),
+        |conn| select_due_web_sources(conn, now_epoch_secs),
+    )
+}
+
+fn select_due_web_sources(conn: &Connection, now_epoch_secs: i64) -> Result<Vec<SourceRecord>> {
     let sql = format!(
         "SELECT {SOURCE_COLUMNS}
          FROM (
@@ -324,19 +337,50 @@ pub fn due_web_sources(config: &VaultConfig, now_epoch_secs: i64) -> Result<Vec<
 /// How long a read waits for a writer's lock before failing with `SQLITE_BUSY`.
 const READ_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Open the vault for reading, or `None` when it does not exist. Never creates it,
-/// never writes, and skips the schema batch that `open_rw_db` re-runs.
-pub(crate) fn open_vault_for_read(config: &VaultConfig) -> Result<Option<Connection>> {
+/// How long one vault read may run before it stops with `QueryTimeout`; the same
+/// default as MCP `query` (`db/readonly.rs`).
+const READ_TIMEOUT: Duration = Duration::from_millis(DEFAULT_QUERY_TIMEOUT_MS);
+
+/// Run `read` on the vault, or `absent` when the vault does not exist. This is the
+/// missing-vault rule: never create the vault, never write. `read` stops with
+/// `QueryTimeout` once it has run for 5 s.
+pub(crate) fn read_vault<T>(
+    config: &VaultConfig,
+    absent: impl FnOnce() -> Result<T>,
+    read: impl FnOnce(&Connection) -> Result<T>,
+) -> Result<T> {
+    read_vault_within(config, READ_TIMEOUT, absent, read)
+}
+
+fn read_vault_within<T>(
+    config: &VaultConfig,
+    timeout: Duration,
+    absent: impl FnOnce() -> Result<T>,
+    read: impl FnOnce(&Connection) -> Result<T>,
+) -> Result<T> {
     let path = config.db_path();
     if !path.exists() {
-        return Ok(None);
+        return absent();
     }
+    // Read-only, and skipping the schema batch that `open_rw_db` re-runs.
     let conn = Connection::open_with_flags(
         &path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
     conn.busy_timeout(READ_BUSY_TIMEOUT)?;
-    Ok(Some(conn))
+    let started = Instant::now();
+    conn.progress_handler(1000, Some(move || started.elapsed() >= timeout))?;
+    read(&conn).map_err(|err| match err {
+        VaultError::Sqlite(ref sqlite)
+            if sqlite.sqlite_error_code() == Some(ErrorCode::OperationInterrupted) =>
+        {
+            VaultError::QueryTimeout(format!(
+                "vault read exceeded {} ms timeout",
+                timeout.as_millis()
+            ))
+        }
+        other => other,
+    })
 }
 
 pub(crate) fn load_source_by_id(conn: &Connection, id: i64) -> Result<SourceRecord> {
@@ -606,9 +650,7 @@ mod tests {
     #[test]
     fn search_runs_the_fts_match_once_not_per_page() {
         let (_dir, config) = seeded_vault();
-        let conn = open_vault_for_read(&config)
-            .expect("open")
-            .expect("vault exists");
+        let conn = open_rw_db(&config.db_path()).expect("open_rw_db");
         let plan: Vec<String> = conn
             .prepare(&format!("EXPLAIN QUERY PLAN {}", page_list_sql(true)))
             .expect("prepare plan")
@@ -634,6 +676,32 @@ mod tests {
                 .any(|line| line.contains("pages_fts") && line.contains("LEFT-JOIN")),
             "MATCH is evaluated per Page row: {plan:#?}"
         );
+    }
+
+    #[test]
+    fn reads_past_the_deadline_time_out() {
+        let (_dir, config) = seeded_vault();
+        let conn = open_rw_db(&config.db_path()).expect("open_rw_db");
+        for i in 0..500 {
+            conn.execute(
+                "INSERT INTO pages (source_id, uri, content_md, content_hash)
+                 VALUES (2, ?1, 'Body text about the vault.', 'h')",
+                [format!("bulk/{i:03}.md")],
+            )
+            .expect("insert bulk page");
+        }
+        drop(conn);
+        let query = search("vault");
+        let err = read_vault_within(
+            &config,
+            Duration::ZERO,
+            || Ok(Vec::new()),
+            |conn| query_pages(conn, &query),
+        )
+        .expect_err("a read past its deadline must stop");
+        assert!(matches!(err, VaultError::QueryTimeout(_)), "{err:?}");
+        // The same read within the default deadline succeeds.
+        assert_eq!(list_pages(&config, &query).expect("list").len(), 502);
     }
 
     #[test]

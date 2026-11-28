@@ -21,9 +21,7 @@ pub use read::{
     all_sources, due_web_sources, find_source, list_pages, list_sources, show_source, PageListItem,
     PageQuery, PageStatuses,
 };
-pub(crate) use read::{
-    load_all_sources, load_source_by_id, load_source_by_name, open_vault_for_read,
-};
+pub(crate) use read::{load_all_sources, load_source_by_id, load_source_by_name, read_vault};
 pub use sections::{split_sections, SectionChunk};
 
 pub(crate) const DEFAULT_MAX_PAGES: u32 = 500;

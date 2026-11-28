@@ -2,11 +2,10 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use rusqlite::OptionalExtension;
+use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::config::VaultConfig;
 use crate::db::readonly::{execute_readonly_query, QueryResult};
 use crate::error::{Result, VaultError};
 use crate::ingest::{
@@ -333,13 +332,23 @@ pub async fn get_page(
     Path(page_id): Path<i64>,
 ) -> ApiResult<Json<PageDetailResponse>> {
     let config = state.config;
-    let page = blocking(move || read_page_detail(&config, page_id)).await?;
+    let page = blocking(move || {
+        ingest::read_vault(
+            &config,
+            || Err(page_not_found(page_id)),
+            |conn| select_page_detail(conn, page_id),
+        )
+    })
+    .await?;
     Ok(Json(page))
 }
 
-fn read_page_detail(config: &VaultConfig, page_id: i64) -> Result<PageDetailResponse> {
-    let not_found = || VaultError::NotFound(format!("page {page_id} not found"));
-    let conn = ingest::open_vault_for_read(config)?.ok_or_else(not_found)?;
+fn page_not_found(page_id: i64) -> VaultError {
+    VaultError::NotFound(format!("page {page_id} not found"))
+}
+
+fn select_page_detail(conn: &Connection, page_id: i64) -> Result<PageDetailResponse> {
+    let not_found = || page_not_found(page_id);
     let page = conn
         .query_row(
             "SELECT p.id, p.source_id, s.name, p.uri, p.title, p.content_md, p.content_hash,
@@ -403,13 +412,19 @@ pub async fn get_page_diff(
     Path(page_id): Path<i64>,
 ) -> ApiResult<Json<PageDiffResponse>> {
     let config = state.config;
-    let diff = blocking(move || read_page_diff(&config, page_id)).await?;
+    let diff = blocking(move || {
+        ingest::read_vault(
+            &config,
+            || Err(page_not_found(page_id)),
+            |conn| select_page_diff(conn, page_id),
+        )
+    })
+    .await?;
     Ok(Json(diff))
 }
 
-fn read_page_diff(config: &VaultConfig, page_id: i64) -> Result<PageDiffResponse> {
-    let not_found = || VaultError::NotFound(format!("page {page_id} not found"));
-    let conn = ingest::open_vault_for_read(config)?.ok_or_else(not_found)?;
+fn select_page_diff(conn: &Connection, page_id: i64) -> Result<PageDiffResponse> {
+    let not_found = || page_not_found(page_id);
     let (uri, title): (String, String) = conn
         .query_row(
             "SELECT uri, title FROM pages WHERE id = ?1",
