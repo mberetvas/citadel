@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use crate::config::VaultConfig;
+use crate::daemon::supervision::Supervision;
 use report::{Check, Report, Section};
 use running::ServeProbe;
 use setup::{McpEntry, SetupLocation};
@@ -65,13 +66,8 @@ pub async fn run_doctor(config: &VaultConfig, opts: &DoctorOpts) -> Report {
     let service = if opts.in_container {
         None
     } else {
-        Some(running::gather_service_state())
+        Some(Supervision::for_vault(config, opts.current_exe.clone()).service())
     };
-    // Only a loaded service can be restarted through launchctl/systemctl.
-    let service_installed = matches!(
-        service,
-        Some(running::ServiceState::Installed { loaded: true, .. })
-    );
     let home_is_cwd = opts
         .home
         .as_deref()
@@ -118,7 +114,7 @@ pub async fn run_doctor(config: &VaultConfig, opts: &DoctorOpts) -> Report {
     let (daemon_version_rows, daemon_running_row) = if opts.in_container {
         (None, None)
     } else {
-        match version::gather_daemon_facts(config, service_installed) {
+        match version::gather_daemon_facts(config) {
             Ok(facts) => (
                 version::daemon_version_check(current, &facts),
                 Some(running::daemon_running_check(

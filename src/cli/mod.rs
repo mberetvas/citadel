@@ -493,20 +493,35 @@ fn dispatch_command<W: Write>(
             Ok(())
         }
         Commands::Daemon { command } => match command {
-            DaemonCommands::Start { foreground } => {
-                if let Some(pid) = crate::daemon::start_daemon(&config, foreground)? {
-                    writeln!(
-                        out,
-                        "Started citadel daemon (pid {pid}, log: {}).",
-                        config.log_path().display()
-                    )?;
-                }
+            DaemonCommands::Start { foreground: true } => {
+                crate::daemon::run_daemon(&config)?;
+                Ok(())
+            }
+            DaemonCommands::Start { foreground: false } => {
+                use crate::daemon::supervision::{Started, Supervision};
+                let supervision = Supervision::for_vault(&config, std::env::current_exe()?);
+                let (pid, how) = match supervision.start()? {
+                    Started::Service(pid) => (pid, " through its OS service"),
+                    Started::Spawned(pid) => (pid, ""),
+                };
+                writeln!(
+                    out,
+                    "Started citadel daemon{how} (pid {pid}, log: {}).",
+                    config.log_path().display()
+                )?;
                 Ok(())
             }
             DaemonCommands::Stop => {
-                match crate::daemon::stop_daemon(&config)? {
-                    Some(pid) => writeln!(out, "Stopped citadel daemon (pid {pid}).")?,
-                    None => writeln!(out, "Daemon is not running.")?,
+                use crate::daemon::supervision::{Stopped, Supervision};
+                let supervision = Supervision::for_vault(&config, std::env::current_exe()?);
+                match supervision.stop()? {
+                    Stopped::Stopped(pid) => writeln!(out, "Stopped citadel daemon (pid {pid}).")?,
+                    Stopped::Relaunched { pid, by } => writeln!(
+                        out,
+                        "Stopped citadel daemon (pid {pid}), but another daemon took over at \
+                         once (pid {by}), most likely relaunched by a service manager."
+                    )?,
+                    Stopped::NotRunning => writeln!(out, "Daemon is not running.")?,
                 }
                 Ok(())
             }

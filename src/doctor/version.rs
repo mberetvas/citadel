@@ -5,7 +5,8 @@ use std::time::Duration;
 
 use crate::config::VaultConfig;
 use crate::daemon::info::{file_mtime_secs, read_daemon_info, DaemonInfo};
-use crate::daemon::{daemon_status, DaemonStatus, LAUNCHD_LABEL, SYSTEMD_SERVICE_NAME};
+use crate::daemon::supervision::RESTART_HINT;
+use crate::daemon::{daemon_status, DaemonStatus};
 use crate::doctor::report::{Check, Section};
 use crate::doctor::running::ServeProbe;
 use crate::error::Result;
@@ -85,10 +86,9 @@ pub struct DaemonFacts {
     pub info: Option<DaemonInfo>,
     /// Current mtime (unix secs) of the file at `info.exe`; `None` if it is gone.
     pub exe_mtime_now: Option<i64>,
-    pub service_installed: bool,
 }
 
-pub fn gather_daemon_facts(config: &VaultConfig, service_installed: bool) -> Result<DaemonFacts> {
+pub fn gather_daemon_facts(config: &VaultConfig) -> Result<DaemonFacts> {
     let status = daemon_status(config)?;
     let info = match status {
         DaemonStatus::Running(pid) => {
@@ -101,19 +101,7 @@ pub fn gather_daemon_facts(config: &VaultConfig, service_installed: bool) -> Res
         status,
         info,
         exe_mtime_now,
-        service_installed,
     })
-}
-
-/// Command that restarts the daemon.
-pub fn restart_hint(service_installed: bool) -> String {
-    if !service_installed {
-        "citadel daemon stop && citadel daemon start".to_string()
-    } else if cfg!(target_os = "macos") {
-        format!("launchctl kickstart -k gui/$(id -u)/{LAUNCHD_LABEL}")
-    } else {
-        format!("systemctl --user restart {SYSTEMD_SERVICE_NAME}")
-    }
 }
 
 /// Compare the running daemon with this CLI; `None` unless a daemon is running.
@@ -122,10 +110,7 @@ pub fn daemon_version_check(current: &str, facts: &DaemonFacts) -> Option<Check>
         return None;
     }
     let name = "daemon version";
-    let warn = |detail: String| {
-        Check::warn(Section::Version, name, detail)
-            .with_hint(&restart_hint(facts.service_installed))
-    };
+    let warn = |detail: String| Check::warn(Section::Version, name, detail).with_hint(RESTART_HINT);
     let Some(info) = &facts.info else {
         return Some(warn(
             "daemon started by an older citadel (version unknown)".to_string(),
@@ -194,7 +179,6 @@ mod tests {
             status: DaemonStatus::Running(5),
             info,
             exe_mtime_now: now,
-            service_installed: false,
         }
     }
 
@@ -286,6 +270,28 @@ mod tests {
     }
 
     #[test]
+    fn restart_hint_never_kickstarts_a_swapped_binary() {
+        // Every warn row means the binary changed under the daemon; launchd can then refuse to
+        // spawn the job (`EX_CONFIG`) while `kickstart -k` exits 0.
+        for (info, now) in [
+            (Some(info("0.2.0", Some(100))), Some(100)),
+            (Some(info("0.3.0", Some(100))), None),
+            (Some(info("0.3.0", Some(100))), Some(200)),
+            (None, None),
+        ] {
+            let check = daemon_version_check("0.3.0", &facts(info, now)).expect("a version row");
+            assert_eq!(check.status, CheckStatus::Warn);
+            // `citadel daemon stop && start` go through the daemon's service when it has one.
+            assert_eq!(
+                check.hint.as_deref(),
+                Some(RESTART_HINT),
+                "{}",
+                check.detail
+            );
+        }
+    }
+
+    #[test]
     fn daemon_binary_missing_warns() {
         let check = daemon_version_check("0.3.0", &facts(Some(info("0.3.0", Some(100))), None))
             .expect("a version row");
@@ -316,7 +322,7 @@ mod tests {
         stale.pid = 1;
         let _guard = DaemonInfoGuard::write(&config.daemon_info_path(), &stale).unwrap();
 
-        let facts = gather_daemon_facts(&config, false).unwrap();
+        let facts = gather_daemon_facts(&config).unwrap();
         assert_eq!(facts.status, DaemonStatus::Running(std::process::id()));
         assert_eq!(facts.info, None);
     }
