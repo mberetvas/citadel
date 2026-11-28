@@ -1124,3 +1124,43 @@ async fn sync_all_reports_a_drivers_not_found_instead_of_skipping_the_source() {
         results[0].result
     );
 }
+
+#[tokio::test]
+async fn sync_takes_over_its_own_claim_whose_release_failed() {
+    let (vault, config, mut lifecycle) = vault_with_docs().await;
+    // A registry of our own, so other tests' guards on Source id 1 do not count.
+    lifecycle.claims.live = claim::LiveGuards::default();
+    let lifecycle = lifecycle.with_driver(FakeDriver::one_page());
+
+    let guard = lifecycle.claim("docs").await.expect("claim").expect("free");
+    let read_only = rusqlite::Connection::open_with_flags(
+        vault.path().join("vault.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .expect("open read-only");
+    guard.release(&read_only).expect_err("release fails");
+    assert_eq!(claim_rows(&config), 1, "the failed release left the row");
+
+    assert!(
+        matches!(
+            lifecycle.sync("docs", false).await.expect("sync"),
+            SyncOutcome::Synced(_)
+        ),
+        "the same process takes its orphaned claim over"
+    );
+    assert_eq!(claim_rows(&config), 0);
+}
+
+#[tokio::test]
+async fn sync_never_takes_over_a_claim_whose_guard_is_alive() {
+    let (_vault, _config, mut lifecycle) = vault_with_docs().await;
+    lifecycle.claims.live = claim::LiveGuards::default();
+    let lifecycle = lifecycle.with_driver(FakeDriver::one_page());
+
+    let held = lifecycle.claim("docs").await.expect("claim").expect("free");
+    assert_eq!(
+        lifecycle.sync("docs", false).await.expect("sync"),
+        SyncOutcome::AlreadySyncing
+    );
+    drop(held);
+}

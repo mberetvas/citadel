@@ -18,6 +18,7 @@ fn env(pid: i64, token: &str, clock: &Arc<AtomicI64>, alive: bool) -> ClaimEnv {
         now: Arc::new(move || clock.load(Ordering::SeqCst)),
         pid_alive: Arc::new(move |_| alive),
         on_late_release: Arc::new(|_| {}),
+        live: LiveGuards::default(),
     }
 }
 
@@ -125,4 +126,96 @@ fn own_claim_never_expires_for_its_holder() {
     // Six hours later a second task in the same process must not take over its own claim.
     clock.store(T0 + MAX_CLAIM_AGE_SECS + 1, Ordering::SeqCst);
     assert!(!try_acquire(&conn, id, &holder).expect("own expired claim stays held"));
+}
+
+fn claim_count(conn: &Connection, id: i64) -> i64 {
+    conn.query_row(
+        "SELECT COUNT(*) FROM sync_claims WHERE source_id = ?1",
+        [id],
+        |r| r.get(0),
+    )
+    .expect("count claims")
+}
+
+/// A connection that cannot write: releasing a claim on it fails.
+fn read_only(dir: &tempfile::TempDir) -> Connection {
+    Connection::open_with_flags(
+        dir.path().join("vault.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .expect("open read-only")
+}
+
+#[test]
+fn failed_release_leaves_an_orphan_its_own_process_takes_over() {
+    let (dir, conn, id) = vault_with_source();
+    let clock = Arc::new(AtomicI64::new(T0));
+    let this_process = env(100, "a", &clock, true);
+    let guard = ClaimGuard::acquire(&conn, dir.path().join("vault.db"), id, &this_process)
+        .expect("acquire")
+        .expect("free");
+
+    guard
+        .release(&read_only(&dir))
+        .expect_err("release on a read-only connection fails");
+    assert_eq!(claim_count(&conn, id), 1, "the failed release left the row");
+
+    assert!(
+        try_acquire(&conn, id, &this_process).expect("claim again"),
+        "no live guard holds the row: this process takes its orphan over"
+    );
+    // Another live process still sees the claim as held.
+    let other = env(200, "b", &clock, true);
+    assert!(!try_acquire(&conn, id, &other).expect("other process"));
+}
+
+#[test]
+fn claim_with_a_live_guard_is_never_taken_over_by_its_own_process() {
+    let (dir, conn, id) = vault_with_source();
+    let clock = Arc::new(AtomicI64::new(T0));
+    let this_process = env(100, "a", &clock, true);
+    let guard = ClaimGuard::acquire(&conn, dir.path().join("vault.db"), id, &this_process)
+        .expect("acquire")
+        .expect("free");
+
+    assert!(!try_acquire(&conn, id, &this_process).expect("second claim"));
+    clock.store(T0 + MAX_CLAIM_AGE_SECS + 1, Ordering::SeqCst);
+    assert!(
+        !try_acquire(&conn, id, &this_process).expect("after the age limit"),
+        "a live guard's claim never expires for its own process"
+    );
+
+    guard.release(&conn).expect("release");
+    assert!(try_acquire(&conn, id, &this_process).expect("claim after release"));
+}
+
+#[test]
+fn only_one_task_takes_over_an_orphan() {
+    let (dir, conn, id) = vault_with_source();
+    let clock = Arc::new(AtomicI64::new(T0));
+    let this_process = env(100, "a", &clock, true);
+    // An orphan: our pid and token, but no live guard (its release failed).
+    conn.execute(
+        "INSERT INTO sync_claims (source_id, pid, instance_token, claimed_at)
+         VALUES (?1, 100, 'a', '2027-01-15T08:00:00Z')",
+        [id],
+    )
+    .expect("insert orphan");
+
+    let path = dir.path().join("vault.db");
+    let takers: Vec<_> = (0..8)
+        .map(|_| {
+            let (path, env) = (path.clone(), this_process.clone());
+            std::thread::spawn(move || {
+                let conn = open_rw_db(&path).expect("open");
+                try_acquire(&conn, id, &env).expect("try_acquire")
+            })
+        })
+        .collect();
+    let won = takers
+        .into_iter()
+        .map(|t| t.join().expect("taker thread"))
+        .filter(|won| *won)
+        .count();
+    assert_eq!(won, 1, "exactly one task takes the orphan over");
 }
