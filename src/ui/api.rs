@@ -2,14 +2,16 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::db::open_rw_db;
+use crate::config::VaultConfig;
 use crate::db::readonly::{execute_readonly_query, QueryResult};
 use crate::error::{Result, VaultError};
-use crate::ingest::{self, SourceRecord, SourceSummary, SyncSummary};
+use crate::ingest::{
+    self, PageListItem, PageQuery, PageStatuses, SourceRecord, SourceSummary, SyncSummary,
+};
 use crate::sources::{AddSourceParams, Removal, RemovedSource, SourceLifecycle};
 use crate::ui::UiState;
 use crate::update::check::{read_status_and_claim_refresh, spawn_background_refresh, UpdateStatus};
@@ -93,23 +95,12 @@ pub struct SyncAcceptedResponse {
 
 #[derive(Debug, Deserialize, Default)]
 pub struct ListPagesQuery {
+    /// Source id or name; every Source when absent. `GET /api/sources/{id}/pages`
+    /// takes it from the path instead.
+    pub source: Option<String>,
+    /// Comma-separated subset of `active,stale,error`.
     pub status: Option<String>,
     pub q: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PageListItem {
-    pub id: i64,
-    pub source_id: i64,
-    pub uri: String,
-    pub title: String,
-    pub word_count: i64,
-    pub status: String,
-    pub http_status: Option<i64>,
-    pub error_message: Option<String>,
-    pub first_seen_at: String,
-    pub last_checked_at: String,
-    pub last_changed_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -183,9 +174,23 @@ pub async fn get_version(State(state): State<UiState>) -> Json<UpdateStatus> {
     Json(status)
 }
 
+/// Run a blocking vault read off the async workers, which `serve` shares with `/mcp`
+/// and the scheduler.
+async fn blocking<T, F>(work: F) -> ApiResult<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T> + Send + 'static,
+{
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|err| VaultError::Other(format!("vault read task failed: {err}")))?
+        .map_err(ApiError)
+}
+
 /// `GET /api/sources`
 pub async fn list_sources(State(state): State<UiState>) -> ApiResult<Json<Vec<SourceSummary>>> {
-    let sources = ingest::list_sources(&state.config)?;
+    let config = state.config;
+    let sources = blocking(move || ingest::list_sources(&config)).await?;
     Ok(Json(sources))
 }
 
@@ -223,7 +228,7 @@ pub async fn delete_source(
     State(state): State<UiState>,
     Path(id_or_slug): Path<String>,
 ) -> ApiResult<(StatusCode, Json<RemovedSource>)> {
-    let (_source_id, source_name) = resolve_source_in_vault(&state.config, &id_or_slug)?;
+    let source_name = resolve_source_name(&state, id_or_slug).await?;
     match SourceLifecycle::new(state.config.clone())
         .remove(&source_name)
         .await?
@@ -245,7 +250,9 @@ pub async fn sync_source(
     Path(id_or_slug): Path<String>,
     Query(query): Query<SyncQuery>,
 ) -> ApiResult<(StatusCode, Json<SyncAcceptedResponse>)> {
-    let (source_id, source_name) = resolve_source_in_vault(&state.config, &id_or_slug)?;
+    let config = state.config.clone();
+    let source = blocking(move || ingest::find_source(&config, &id_or_slug)).await?;
+    let (source_id, source_name) = (source.id, source.name);
 
     // Wait for the claim before replying, so a second request gets 409 instead of a silent
     // no-op. The Sync runs as its own task: a client that disconnects does not stop it.
@@ -277,35 +284,46 @@ pub async fn sync_source(
     ))
 }
 
-/// `GET /api/sources/{id}/pages`
+/// `GET /api/pages`: Pages of one Source (`?source=`) or of every Source.
+pub async fn list_pages(
+    State(state): State<UiState>,
+    Query(query): Query<ListPagesQuery>,
+) -> ApiResult<Json<Vec<PageListItem>>> {
+    let source = query.source.clone().filter(|s| !s.trim().is_empty());
+    read_pages(state, source, query).await
+}
+
+/// `GET /api/sources/{id}/pages`: Pages of one Source.
 pub async fn list_source_pages(
     State(state): State<UiState>,
     Path(id_or_slug): Path<String>,
     Query(query): Query<ListPagesQuery>,
 ) -> ApiResult<Json<Vec<PageListItem>>> {
-    let status_filter = match query.status.as_deref().map(str::trim) {
-        None | Some("") => None,
-        Some(s @ ("active" | "stale" | "error")) => Some(s),
-        Some(other) => {
-            return Err(VaultError::Validation(format!(
-                "invalid page status '{other}'; expected one of: active, stale, error"
-            ))
-            .into());
-        }
-    };
+    read_pages(state, Some(id_or_slug), query).await
+}
 
-    let (source_id, _source_name) = resolve_source_in_vault(&state.config, &id_or_slug)?;
-    let conn = open_rw_db(&state.config.db_path())?;
-    let search_q = query.q.as_deref().map(str::trim).filter(|s| !s.is_empty());
-
-    let pages = match search_q {
-        Some(term) => match query_pages_fts(&conn, source_id, status_filter, term) {
-            Ok(rows) => rows,
-            Err(_) => query_pages_like(&conn, source_id, status_filter, term)?,
-        },
-        None => query_pages_plain(&conn, source_id, status_filter)?,
-    };
-
+async fn read_pages(
+    state: UiState,
+    source: Option<String>,
+    query: ListPagesQuery,
+) -> ApiResult<Json<Vec<PageListItem>>> {
+    let statuses = PageStatuses::parse(query.status.as_deref().unwrap_or(""))?;
+    let config = state.config;
+    let pages = blocking(move || {
+        let source_id = match source {
+            Some(key) => Some(ingest::find_source(&config, &key)?.id),
+            None => None,
+        };
+        ingest::list_pages(
+            &config,
+            &PageQuery {
+                source_id,
+                statuses,
+                search: query.q,
+            },
+        )
+    })
+    .await?;
     Ok(Json(pages))
 }
 
@@ -314,11 +332,14 @@ pub async fn get_page(
     State(state): State<UiState>,
     Path(page_id): Path<i64>,
 ) -> ApiResult<Json<PageDetailResponse>> {
-    if !state.config.db_path().exists() {
-        return Err(VaultError::NotFound(format!("page {page_id} not found")).into());
-    }
+    let config = state.config;
+    let page = blocking(move || read_page_detail(&config, page_id)).await?;
+    Ok(Json(page))
+}
 
-    let conn = open_rw_db(&state.config.db_path())?;
+fn read_page_detail(config: &VaultConfig, page_id: i64) -> Result<PageDetailResponse> {
+    let not_found = || VaultError::NotFound(format!("page {page_id} not found"));
+    let conn = ingest::open_vault_for_read(config)?.ok_or_else(not_found)?;
     let page = conn
         .query_row(
             "SELECT p.id, p.source_id, s.name, p.uri, p.title, p.content_md, p.content_hash,
@@ -350,18 +371,15 @@ pub async fn get_page(
                 })
             },
         )
-        .optional()
-        .map_err(VaultError::from)?
-        .ok_or_else(|| VaultError::NotFound(format!("page {page_id} not found")))?;
+        .optional()?
+        .ok_or_else(not_found)?;
 
-    let mut stmt = conn
-        .prepare(
-            "SELECT id, ordinal, heading, heading_path, level, content_md, word_count
-             FROM sections
-             WHERE page_id = ?1
-             ORDER BY ordinal ASC",
-        )
-        .map_err(VaultError::from)?;
+    let mut stmt = conn.prepare(
+        "SELECT id, ordinal, heading, heading_path, level, content_md, word_count
+         FROM sections
+         WHERE page_id = ?1
+         ORDER BY ordinal ASC",
+    )?;
     let sections = stmt
         .query_map([page_id], |row| {
             Ok(PageSectionItem {
@@ -373,12 +391,10 @@ pub async fn get_page(
                 content_md: row.get(5)?,
                 word_count: row.get(6)?,
             })
-        })
-        .map_err(VaultError::from)?
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(VaultError::from)?;
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
 
-    Ok(Json(PageDetailResponse { sections, ..page }))
+    Ok(PageDetailResponse { sections, ..page })
 }
 
 /// `GET /api/pages/{id}/diff`
@@ -386,20 +402,22 @@ pub async fn get_page_diff(
     State(state): State<UiState>,
     Path(page_id): Path<i64>,
 ) -> ApiResult<Json<PageDiffResponse>> {
-    if !state.config.db_path().exists() {
-        return Err(VaultError::NotFound(format!("page {page_id} not found")).into());
-    }
+    let config = state.config;
+    let diff = blocking(move || read_page_diff(&config, page_id)).await?;
+    Ok(Json(diff))
+}
 
-    let conn = open_rw_db(&state.config.db_path())?;
+fn read_page_diff(config: &VaultConfig, page_id: i64) -> Result<PageDiffResponse> {
+    let not_found = || VaultError::NotFound(format!("page {page_id} not found"));
+    let conn = ingest::open_vault_for_read(config)?.ok_or_else(not_found)?;
     let (uri, title): (String, String) = conn
         .query_row(
             "SELECT uri, title FROM pages WHERE id = ?1",
             [page_id],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
-        .optional()
-        .map_err(VaultError::from)?
-        .ok_or_else(|| VaultError::NotFound(format!("page {page_id} not found")))?;
+        .optional()?
+        .ok_or_else(not_found)?;
 
     let revision: Option<(String, String, String, String)> = conn
         .query_row(
@@ -409,8 +427,7 @@ pub async fn get_page_diff(
             [page_id],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
-        .optional()
-        .map_err(VaultError::from)?;
+        .optional()?;
 
     let response = match revision {
         Some((previous_hash, new_hash, unified_diff, changed_at)) => PageDiffResponse {
@@ -435,7 +452,7 @@ pub async fn get_page_diff(
         },
     };
 
-    Ok(Json(response))
+    Ok(response)
 }
 
 /// `POST /api/query`
@@ -443,121 +460,14 @@ pub async fn query(
     State(state): State<UiState>,
     Json(payload): Json<QueryRequest>,
 ) -> ApiResult<Json<QueryResult>> {
-    let result = execute_readonly_query(&state.config.db_path(), &payload.sql, payload.limit)?;
+    let db_path = state.config.db_path();
+    let result =
+        blocking(move || execute_readonly_query(&db_path, &payload.sql, payload.limit)).await?;
     Ok(Json(result))
 }
 
-fn resolve_source_in_vault(
-    config: &crate::config::VaultConfig,
-    id_or_slug: &str,
-) -> Result<(i64, String)> {
-    if !config.db_path().exists() {
-        return Err(VaultError::NotFound(format!(
-            "source '{id_or_slug}' not found"
-        )));
-    }
-    let conn = open_rw_db(&config.db_path())?;
-    resolve_source_id_and_name(&conn, id_or_slug)
-}
-
-fn resolve_source_id_and_name(conn: &Connection, id_or_slug: &str) -> Result<(i64, String)> {
-    if let Ok(parsed_id) = id_or_slug.parse::<i64>() {
-        if let Some(found) = conn
-            .query_row(
-                "SELECT id, name FROM sources WHERE id = ?1",
-                [parsed_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()?
-        {
-            return Ok(found);
-        }
-    }
-
-    conn.query_row(
-        "SELECT id, name FROM sources WHERE name = ?1",
-        [id_or_slug],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    )
-    .optional()?
-    .ok_or_else(|| VaultError::NotFound(format!("source '{id_or_slug}' not found")))
-}
-
-fn query_pages_plain(
-    conn: &Connection,
-    source_id: i64,
-    status: Option<&str>,
-) -> Result<Vec<PageListItem>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, source_id, uri, title, word_count, status, http_status,
-                error_message, first_seen_at, last_checked_at, last_changed_at
-         FROM pages
-         WHERE source_id = ?1
-           AND (?2 IS NULL OR status = ?2)
-         ORDER BY uri ASC",
-    )?;
-    let rows = stmt
-        .query_map(params![source_id, status], map_page_list_item)?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    Ok(rows)
-}
-
-fn query_pages_fts(
-    conn: &Connection,
-    source_id: i64,
-    status: Option<&str>,
-    term: &str,
-) -> Result<Vec<PageListItem>> {
-    let mut stmt = conn.prepare(
-        "SELECT p.id, p.source_id, p.uri, p.title, p.word_count, p.status, p.http_status,
-                p.error_message, p.first_seen_at, p.last_checked_at, p.last_changed_at
-         FROM pages p
-         JOIN pages_fts ON pages_fts.rowid = p.id
-         WHERE p.source_id = ?1
-           AND (?2 IS NULL OR p.status = ?2)
-           AND pages_fts MATCH ?3
-         ORDER BY bm25(pages_fts), p.uri ASC",
-    )?;
-    let rows = stmt
-        .query_map(params![source_id, status, term], map_page_list_item)?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    Ok(rows)
-}
-
-fn query_pages_like(
-    conn: &Connection,
-    source_id: i64,
-    status: Option<&str>,
-    term: &str,
-) -> Result<Vec<PageListItem>> {
-    let pattern = format!("%{term}%");
-    let mut stmt = conn.prepare(
-        "SELECT id, source_id, uri, title, word_count, status, http_status,
-                error_message, first_seen_at, last_checked_at, last_changed_at
-         FROM pages
-         WHERE source_id = ?1
-           AND (?2 IS NULL OR status = ?2)
-           AND (title LIKE ?3 OR uri LIKE ?3 OR content_md LIKE ?3)
-         ORDER BY uri ASC",
-    )?;
-    let rows = stmt
-        .query_map(params![source_id, status, pattern], map_page_list_item)?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    Ok(rows)
-}
-
-fn map_page_list_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<PageListItem> {
-    Ok(PageListItem {
-        id: row.get(0)?,
-        source_id: row.get(1)?,
-        uri: row.get(2)?,
-        title: row.get(3)?,
-        word_count: row.get(4)?,
-        status: row.get(5)?,
-        http_status: row.get(6)?,
-        error_message: row.get(7)?,
-        first_seen_at: row.get(8)?,
-        last_checked_at: row.get(9)?,
-        last_changed_at: row.get(10)?,
-    })
+async fn resolve_source_name(state: &UiState, id_or_slug: String) -> ApiResult<String> {
+    let config = state.config.clone();
+    let source = blocking(move || ingest::find_source(&config, &id_or_slug)).await?;
+    Ok(source.name)
 }

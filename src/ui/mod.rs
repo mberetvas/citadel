@@ -67,6 +67,7 @@ fn build_ui_routes(state: UiState) -> Router {
         .route("/api/sources/{id}", delete(api::delete_source))
         .route("/api/sources/{id}/sync", post(api::sync_source))
         .route("/api/sources/{id}/pages", get(api::list_source_pages))
+        .route("/api/pages", get(api::list_pages))
         .route("/api/pages/{id}", get(api::get_page))
         .route("/api/pages/{id}/diff", get(api::get_page_diff))
         .route("/api/query", post(api::query))
@@ -593,6 +594,83 @@ mod tests {
         }
     }
 
+    async fn get_json(app: &Router, uri: &str) -> (StatusCode, Value) {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(uri)
+                    .body(Body::empty())
+                    .expect("build GET request"),
+            )
+            .await
+            .expect("GET response");
+        let status = resp.status();
+        (status, read_json_body(resp).await)
+    }
+
+    #[tokio::test]
+    async fn all_sources_page_list_has_http_status_and_no_cap() {
+        let vault_dir = tempdir().expect("vault tempdir");
+        let config = VaultConfig::new(vault_dir.path());
+        let conn = open_rw_db(&config.db_path()).expect("init db");
+        conn.execute_batch(
+            "INSERT INTO sources (id, name, kind, origin) VALUES
+                 (1, 'alpha', 'web', 'https://alpha.example.com/'),
+                 (2, 'beta', 'local', '/tmp/beta');
+             INSERT INTO pages (source_id, uri, title, content_md, content_hash, status,
+                                http_status, error_message)
+             VALUES (1, 'https://alpha.example.com/gone', 'Gone', 'Old copy.', 'h', 'error',
+                     404, 'HTTP 404');",
+        )
+        .expect("seed sources");
+        for i in 0..120 {
+            conn.execute(
+                "INSERT INTO pages (source_id, uri, content_md, content_hash)
+                 VALUES (2, ?1, 'Body text.', 'h')",
+                [format!("bulk/{i:03}.md")],
+            )
+            .expect("insert bulk page");
+        }
+        drop(conn);
+        let app = build_router(config);
+
+        // All sources: every Page, with http_status, beyond the old 100-row cap.
+        let (status, pages) = get_json(&app, "/api/pages").await;
+        assert_eq!(status, StatusCode::OK);
+        let pages = pages.as_array().expect("pages array");
+        assert_eq!(pages.len(), 121);
+        let gone = pages
+            .iter()
+            .find(|p| p["uri"] == "https://alpha.example.com/gone")
+            .expect("error page listed");
+        assert_eq!(gone["http_status"], 404);
+        assert_eq!(gone["error_message"], "HTTP 404");
+        assert_eq!(gone["source_name"], "alpha");
+
+        // Status set and search, across Sources; a term FTS5 would reject is fine.
+        let (status, pages) = get_json(&app, "/api/pages?status=stale,error&q=old-copy").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(pages.as_array().expect("array").len(), 1);
+
+        // One Source, by query parameter or by path: the same read.
+        let (_, by_param) = get_json(&app, "/api/pages?source=beta&status=active").await;
+        let (_, by_path) = get_json(&app, "/api/sources/2/pages?status=active").await;
+        assert_eq!(by_param.as_array().expect("array").len(), 120);
+        assert_eq!(by_param, by_path);
+
+        // Same validation on both endpoints.
+        for uri in ["/api/pages?status=gone", "/api/sources/1/pages?status=gone"] {
+            let (status, _) = get_json(&app, uri).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+        }
+        for uri in ["/api/pages?source=nope", "/api/sources/nope/pages"] {
+            let (status, _) = get_json(&app, uri).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{uri}");
+        }
+    }
+
     #[tokio::test]
     async fn rejects_cross_origin_mutating_requests() {
         let vault_dir = tempdir().expect("vault tempdir");
@@ -857,9 +935,31 @@ mod tests {
             "renderPageStatusBanner",
             "navigateToBrowser",
             "error_message",
-            "hasFailingHttp",
+            "status === \"error\"",
         ] {
             assert!(app_js.contains(expected), "app.js missing `{expected}`");
+        }
+    }
+
+    #[tokio::test]
+    async fn ui_assets_read_page_lists_from_the_server() {
+        let vault_dir = tempdir().expect("vault tempdir");
+        let app = build_router(VaultConfig::new(vault_dir.path()));
+
+        let app_js = get_asset_text(&app, "/app.js").await;
+        assert!(app_js.contains("/api/pages"), "app.js must use /api/pages");
+        // The Browser and the Health list no longer build SQL in the client, and the
+        // banner's Error rule is the server's (`pages.status`), not its own.
+        for forbidden in [
+            "queryAllSourcePages",
+            "escapeSqlLiteral",
+            "SELECT p.id",
+            "hasFailingHttp",
+        ] {
+            assert!(
+                !app_js.contains(forbidden),
+                "app.js still has `{forbidden}`"
+            );
         }
     }
 
