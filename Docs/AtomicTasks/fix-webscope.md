@@ -93,3 +93,22 @@ spider receives the identical strings, so store ⊆ crawl holds by construction.
 - `sources::tests::web_source_patterns_are_validated_on_add_and_update`.
 
 Every glob-valid pattern now translates to a regex, so the web parser accepts exactly the patterns that local validation accepts. The lifecycle wiring keeps validation and Sync on one parser; it does not fix a separate bug.
+
+## Review fixes
+
+Source: the independent `/code-review` of `116f42c..731a597`. Fix commits: `ad27266` (code), `4d5b100` (SPEC §4.1).
+
+| # | Finding | Outcome | Evidence |
+|---|---|---|---|
+| 1 | No version bump | **Deferred** by instruction | The bump and the `vX.Y.Z` tag happen once, at merge. |
+| 2 | A `?` meant as the query separator is accepted but matches nothing | **Fixed: rejected by validation** | `ad27266`. `UrlPattern::parse` rejects a pattern whose `?` is followed by `=` or `&` and says that patterns match the path only. Red then green: `patterns_glob_rejects_are_validation_errors`, rows `https://ex.com/search?q=rust`, `search?q=*` and `list?a=1&b=*`. |
+| 3 | Patterns are matched against the percent-encoded URL (pre-existing) | **Fixed** (contained to parsing) | `ad27266`. Literal characters are encoded with url's path set (`\` becomes `/`). `?` and classes match one encoded character. A negated class or a range with an encoded member is rejected. Red then green: `crawl_and_store_filters_agree` (rows `my docs/*`, `docs/é*`, `docs/v?` on `v%C3%A9`, `[^a]` on `%5E`) and `relative_pattern_regex_matches_like_glob`. That test now runs the regex on the path `Url::set_path` encodes, not on a decoded path no URL has (13 failures were red). |
+| 4 | An absolute pattern with an uppercase host or a default port matches nothing (pre-existing) | **Fixed** | `ad27266`. `normalize_absolute_pattern` lowercases the scheme and authority and drops `:80`/`:443`. Red then green: `crawl_and_store_filters_agree` rows `HTTPS://Ex.com/docs` and `https://ex.com:443/docs/*`. |
+| 5 | An Origin that names a file scopes only that page and the paths below it (pre-existing) | **Deferred: follow-up** | It is out of this task's scope and unchanged from `main`. `normalize_prefix` keeps the file segment. A follow-up should decide whether `/guide/index.html` scopes `/guide/`. |
+| 6 | Stale `spider_admits` doc comment | **Fixed** | `ad27266` describes the returned tuple. |
+
+Choice for finding 2: rejection, not literal query matching. Every other part of the scope ignores the query string (`QUERY_TAIL`), so matching it in one kind of pattern would add a second rule. The error tells the user what to write instead.
+
+Remaining risk:
+- A stored web Source with a query-like pattern now fails its Sync with a validation error. Updating its patterns fixes it.
+- A literal `%` in a pattern is kept as written. A hand-encoded `%c3` (lowercase hex) does not match the uppercase hex that `url` emits, but URLs a site links to can keep their own casing.
