@@ -15,8 +15,8 @@ use crate::config::VaultConfig;
 use crate::db::open_rw_db;
 use crate::error::{Result, VaultError};
 use crate::ingest::{
-    load_all_sources, load_source_by_id, load_source_by_name, local, web, SourceKind,
-    SourceRecord, SyncSummary, DEFAULT_MAX_DEPTH, DEFAULT_MAX_PAGES,
+    load_all_sources, load_source_by_id, load_source_by_name, local, web, SourceKind, SourceRecord,
+    SyncSummary, DEFAULT_MAX_DEPTH, DEFAULT_MAX_PAGES,
 };
 
 mod claim;
