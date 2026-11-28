@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
+use regex::RegexSet;
 use spider::compact_str::CompactString;
 use spider::configuration::{RedirectPolicy, WaitForIdleNetwork, WaitForSelector};
 use spider::page::Page;
@@ -8,7 +9,6 @@ use spider::website::Website;
 use url::Url;
 
 use crate::error::{Result, VaultError};
-use crate::ingest::local::PatternMatcher;
 use crate::ingest::persist::{OnWritten, SyncPages};
 use crate::ingest::SourceRecord;
 use crate::sources::origin::is_private_host;
@@ -84,17 +84,29 @@ const STATIC_ASSET_EXTENSIONS: &[&str] = &[
     "rpm", "wasm",
 ];
 
+/// Ends every scope regex: a match may be followed by a query string or fragment, nothing else.
+const QUERY_TAIL: &str = "(?:[?#].*)?$";
+/// A character class that matches nothing (a glob class whose only ranges are reversed).
+const NO_CHAR: &str = r"[^\x00-\x{10FFFF}]";
+
+/// Which URLs belong to a web Source: built once per Sync from the Origin and the Source's
+/// include/exclude patterns. Each pattern is parsed once ([`UrlPattern`]) into regexes anchored on
+/// the absolute URL. spider gets those regex strings as its whitelist/blacklist and
+/// `should_crawl`/`should_store` match the same strings, so every storable URL is crawlable.
 #[derive(Debug, Clone)]
 struct WebScope {
     origin: Url,
-    origin_prefix: String,
     origin_scheme: String,
     origin_host: String,
     origin_port: Option<u16>,
-    has_includes: bool,
-    matcher: PatternMatcher,
-    include_patterns: Vec<String>,
-    exclude_patterns: Vec<String>,
+    /// The Origin page (only when includes are set, so its links are followed), then the
+    /// includes, or the Origin's path prefix when there are none.
+    crawl_allow: Vec<String>,
+    /// The static-asset rule, then the excludes.
+    deny: Vec<String>,
+    crawl_allow_set: RegexSet,
+    store_allow_set: RegexSet,
+    deny_set: RegexSet,
 }
 
 impl WebScope {
@@ -103,18 +115,40 @@ impl WebScope {
             .host_str()
             .ok_or_else(|| VaultError::Validation(format!("origin URL '{origin}' lacks a host")))?
             .to_ascii_lowercase();
-        let matcher = PatternMatcher::new(include_patterns, exclude_patterns)?;
+        let port = origin.port().map(|p| format!(":{p}")).unwrap_or_default();
+        let authority = format!(
+            "{}://{}{port}",
+            regex::escape(&origin.scheme().to_ascii_lowercase()),
+            regex::escape(&host)
+        );
+        let prefix = normalize_prefix(origin.path());
+        let includes = pattern_regexes(&authority, &prefix, include_patterns)?;
+        let excludes = pattern_regexes(&authority, &prefix, exclude_patterns)?;
+
+        let (seed, store_allow) = if includes.is_empty() {
+            let path = regex::escape(prefix.trim_end_matches('/'));
+            (None, vec![format!("^{authority}{path}(?:[/?#].*)?$")])
+        } else {
+            let path = regex::escape(origin.path().trim_end_matches('/'));
+            (Some(format!("^{authority}{path}/?{QUERY_TAIL}")), includes)
+        };
+        let crawl_allow: Vec<String> = seed.into_iter().chain(store_allow.clone()).collect();
+        let asset_rule = format!(
+            r"^[^?#]*\.(?i:{}){QUERY_TAIL}",
+            STATIC_ASSET_EXTENSIONS.join("|")
+        );
+        let deny: Vec<String> = std::iter::once(asset_rule).chain(excludes).collect();
 
         Ok(Self {
             origin: origin.clone(),
-            origin_prefix: normalize_prefix(origin.path()),
             origin_scheme: origin.scheme().to_ascii_lowercase(),
             origin_host: host,
             origin_port: origin.port_or_known_default(),
-            has_includes: !include_patterns.is_empty(),
-            matcher,
-            include_patterns: include_patterns.to_vec(),
-            exclude_patterns: exclude_patterns.to_vec(),
+            crawl_allow_set: compile_regex_set(&crawl_allow)?,
+            store_allow_set: compile_regex_set(&store_allow)?,
+            deny_set: compile_regex_set(&deny)?,
+            crawl_allow,
+            deny,
         })
     }
 
@@ -127,145 +161,297 @@ impl WebScope {
         scheme_ok && host_ok && port_ok
     }
 
-    fn matches_prefix(&self, url: &Url) -> bool {
-        matches_url_prefix(&self.origin_prefix, url.path())
-    }
-
-    fn matches_pattern_candidates(&self, url: &Url, matcher: &PatternMatcher) -> bool {
-        let root_rel = url.path().trim_start_matches('/');
-        if matcher.matches(root_rel) || matcher.matches(url.as_str()) {
-            return true;
-        }
-        if let Some(origin_rel) = self.origin_relative_path(url.path()) {
-            if !origin_rel.is_empty() && matcher.matches(origin_rel) {
-                return true;
-            }
-        }
-        false
-    }
-
-    fn is_excluded(&self, url: &Url) -> bool {
-        if self.exclude_patterns.is_empty() {
-            return false;
-        }
-        let Ok(exclude_only) = PatternMatcher::new(&[], &self.exclude_patterns) else {
-            return false;
-        };
-        let root_rel = url.path().trim_start_matches('/');
-        if !exclude_only.matches(root_rel) || !exclude_only.matches(url.as_str()) {
-            return true;
-        }
-        if let Some(origin_rel) = self.origin_relative_path(url.path()) {
-            if !origin_rel.is_empty() && !exclude_only.matches(origin_rel) {
-                return true;
-            }
-        }
-        false
-    }
-
-    fn is_included(&self, url: &Url) -> bool {
-        if !self.has_includes {
-            return self.matches_prefix(url);
-        }
-        let Ok(include_only) = PatternMatcher::new(&self.include_patterns, &[]) else {
-            return false;
-        };
-        self.matches_pattern_candidates(url, &include_only)
-    }
-
     fn should_crawl(&self, url: &Url) -> bool {
-        if !self.same_authority(url) || is_static_asset_url(url) || self.is_excluded(url) {
-            return false;
-        }
-        if !self.has_includes {
-            return self.matches_prefix(url);
-        }
-        canonical_dedup_key(url) == canonical_dedup_key(&self.origin) || self.is_included(url)
+        self.same_authority(url)
+            && self.crawl_allow_set.is_match(url.as_str())
+            && !self.deny_set.is_match(url.as_str())
     }
 
     fn should_store(&self, url: &Url) -> bool {
-        if !self.same_authority(url) || is_static_asset_url(url) || self.is_excluded(url) {
-            return false;
-        }
-        if !self.has_includes {
-            return self.matches_prefix(url);
-        }
-        self.is_included(url)
-    }
-
-    fn origin_relative_path<'a>(&self, candidate_path: &'a str) -> Option<&'a str> {
-        if self.origin_prefix == "/" {
-            return Some(candidate_path.trim_start_matches('/'));
-        }
-        if let Some(rest) = candidate_path.strip_prefix(&self.origin_prefix) {
-            if rest.is_empty() || rest == "/" {
-                return Some("");
-            }
-            if let Some(sub) = rest.strip_prefix('/') {
-                return Some(sub);
-            }
-        }
-        None
-    }
-
-    fn authority_regex(&self) -> String {
-        let scheme = escape_regex_literal(&self.origin_scheme);
-        let host = escape_regex_literal(&self.origin_host);
-        let port = match self.origin.port() {
-            Some(p) => format!(":{p}"),
-            None => String::new(),
-        };
-        format!(r"{scheme}://{host}{port}")
+        self.same_authority(url)
+            && self.store_allow_set.is_match(url.as_str())
+            && !self.deny_set.is_match(url.as_str())
     }
 
     fn whitelist_regexes(&self) -> Vec<CompactString> {
-        let auth = self.authority_regex();
-        if !self.has_includes {
-            let re = if self.origin_prefix == "/" {
-                format!(r"^{auth}(/|$|\?|#)")
-            } else {
-                format!(
-                    r"^{auth}{}(/|$|\?|#)",
-                    escape_regex_literal(&self.origin_prefix)
-                )
-            };
-            return vec![re.into()];
-        }
-
-        let mut list = Vec::with_capacity(self.include_patterns.len() + 1);
-        let origin_path = self.origin.path().trim_end_matches('/');
-        if origin_path.is_empty() {
-            list.push(CompactString::from(format!(r"^{auth}/?($|\?|#)")));
-        } else {
-            list.push(CompactString::from(format!(
-                r"^{auth}{}/?($|\?|#)",
-                escape_regex_literal(origin_path)
-            )));
-        }
-        for pat in &self.include_patterns {
-            list.extend(
-                pattern_to_url_regexes(&auth, &self.origin_prefix, pat)
-                    .into_iter()
-                    .map(CompactString::from),
-            );
-        }
-        list
+        self.crawl_allow.iter().map(CompactString::from).collect()
     }
 
     fn blacklist_regexes(&self) -> Vec<CompactString> {
-        let auth = self.authority_regex();
-        let mut list = vec![CompactString::from(
-            r"\.(png|jpe?g|gif|webp|svg|ico|bmp|tiff|avif|css|js|mjs|cjs|map|woff2?|ttf|otf|eot|mp3|mp4|webm|ogg|wav|avi|mov|pdf|zip|tar|gz|tgz|bz2|xz|7z|rar|exe|dmg|pkg|deb|rpm|wasm)(\?.*)?$",
-        )];
-        for pat in &self.exclude_patterns {
-            list.extend(
-                pattern_to_url_regexes(&auth, &self.origin_prefix, pat)
-                    .into_iter()
-                    .map(CompactString::from),
-            );
-        }
-        list
+        self.deny.iter().map(CompactString::from).collect()
     }
+}
+
+/// Check a web Source's include/exclude patterns with the parser its Syncs use, so a pattern
+/// that cannot be matched fails when the Source is added or updated, not during a Sync.
+pub(crate) fn validate_scope_patterns(
+    origin: &str,
+    include_patterns: &[String],
+    exclude_patterns: &[String],
+) -> Result<()> {
+    let origin = Url::parse(origin).map_err(|err| {
+        VaultError::Validation(format!("invalid web source URL '{origin}': {err}"))
+    })?;
+    WebScope::new(&origin, include_patterns, exclude_patterns).map(drop)
+}
+
+fn compile_regex_set(regexes: &[String]) -> Result<RegexSet> {
+    RegexSet::new(regexes).map_err(|err| {
+        VaultError::Validation(format!("include/exclude pattern cannot be matched: {err}"))
+    })
+}
+
+/// One include/exclude pattern of a web Source, parsed once into a regex body that matches the
+/// rest of the URL to its end (a query string or fragment may follow).
+enum UrlPattern {
+    /// An `http://` or `https://` pattern, matched against the whole URL.
+    Absolute(String),
+    /// Matched against the path from the host root and from the Origin's path prefix.
+    Relative(String),
+}
+
+impl UrlPattern {
+    /// A pattern with `*`, `?` or `[` is a glob with `glob` 0.3 syntax (checked by
+    /// `glob::Pattern::new`); any other pattern is a path prefix of whole segments. URLs are
+    /// matched percent-encoded, so the pattern's literal characters are encoded the way `url`
+    /// encodes a path. An absolute pattern's scheme and host are lowercased and a default port
+    /// dropped, as `url` normalizes them.
+    fn parse(raw: &str) -> Result<Self> {
+        let trimmed = raw.trim();
+        let absolute = normalize_absolute_pattern(trimmed);
+        let text = match &absolute {
+            Some(normalized) => normalized.as_str(),
+            None => trimmed.trim_start_matches("./").trim_start_matches('/'),
+        };
+        if text.is_empty() {
+            return Err(VaultError::Validation(
+                "include/exclude pattern must not be empty".into(),
+            ));
+        }
+        if text.contains('#') {
+            return Err(VaultError::Validation(format!(
+                "pattern '{raw}' contains '#'; patterns match only the URL path (fragments are \
+                 ignored), so remove the '#...' part"
+            )));
+        }
+        // A `?` followed by `=` or `&` within the same path segment reads as a query string; a
+        // `=` or `&` in a later segment is an ordinary path character.
+        let query_like = text.split('?').skip(1).any(|after| {
+            after
+                .split('/')
+                .next()
+                .is_some_and(|seg| seg.contains(['=', '&']))
+        });
+        if query_like {
+            return Err(VaultError::Validation(format!(
+                "pattern '{raw}' looks like it matches a query string; patterns match only \
+                 the URL path (any query string may follow a match), and '?' stands for one \
+                 path character"
+            )));
+        }
+        let body = if text.contains(['*', '?', '[']) {
+            glob::Pattern::new(text).map_err(|err| {
+                VaultError::Validation(format!("invalid glob pattern '{raw}': {err}"))
+            })?;
+            format!("{}{QUERY_TAIL}", glob_to_url_regex(text, raw)?)
+        } else {
+            let literal: String = text
+                .trim_end_matches('/')
+                .chars()
+                .map(encoded_literal)
+                .collect();
+            format!("{literal}(?:[/?#].*)?$")
+        };
+        Ok(if absolute.is_some() {
+            Self::Absolute(body)
+        } else {
+            Self::Relative(body)
+        })
+    }
+}
+
+/// An `http(s)://` pattern with its scheme and authority lowercased and a default port dropped,
+/// or `None` for a relative pattern.
+fn normalize_absolute_pattern(pattern: &str) -> Option<String> {
+    let (scheme, rest) = pattern.split_once("://")?;
+    let scheme = scheme.to_ascii_lowercase();
+    let default_port = match scheme.as_str() {
+        "http" => ":80",
+        "https" => ":443",
+        _ => return None,
+    };
+    let (authority, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
+    let authority = authority.to_ascii_lowercase();
+    let authority = authority.strip_suffix(default_port).unwrap_or(&authority);
+    Some(format!("{scheme}://{authority}{path}"))
+}
+
+/// Whether `url` percent-encodes `ch` in a path (the WHATWG path percent-encode set, non-ASCII,
+/// and the backslash, which special URLs turn into `/`).
+fn encoded_in_path(ch: char) -> bool {
+    !ch.is_ascii()
+        || ch.is_ascii_control()
+        || matches!(
+            ch,
+            ' ' | '"' | '#' | '<' | '>' | '?' | '^' | '`' | '{' | '}' | '\\'
+        )
+}
+
+/// A literal pattern character as a regex for its form in a percent-encoded URL path.
+fn encoded_literal(ch: char) -> String {
+    if ch == '\\' {
+        return "/".to_string();
+    }
+    if !encoded_in_path(ch) {
+        return regex::escape(ch.encode_utf8(&mut [0u8; 4]));
+    }
+    // `url` writes the escapes it adds in uppercase but keeps a link's own escapes as written,
+    // so match the hex digits in either case.
+    ch.encode_utf8(&mut [0u8; 4])
+        .bytes()
+        .map(|b| {
+            let hex: String = format!("{b:02X}")
+                .chars()
+                .map(|d| {
+                    if d.is_ascii_alphabetic() {
+                        format!("[{d}{}]", d.to_ascii_lowercase())
+                    } else {
+                        d.to_string()
+                    }
+                })
+                .collect();
+            format!("%{hex}")
+        })
+        .collect()
+}
+
+/// The anchored regexes of every pattern: one for an absolute pattern; for a relative one, one
+/// from the host root and, when the Origin has a path prefix, one from that prefix.
+fn pattern_regexes(
+    authority: &str,
+    origin_prefix: &str,
+    patterns: &[String],
+) -> Result<Vec<String>> {
+    let mut out = Vec::with_capacity(patterns.len());
+    for raw in patterns {
+        match UrlPattern::parse(raw)? {
+            UrlPattern::Absolute(body) => out.push(format!("^{body}")),
+            UrlPattern::Relative(body) => {
+                out.push(format!("^{authority}/{body}"));
+                if origin_prefix != "/" {
+                    let prefix = regex::escape(origin_prefix);
+                    out.push(format!("^{authority}{prefix}/{body}"));
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Translate a glob that `glob::Pattern::new` accepted into a regex with the same meaning on a
+/// percent-encoded URL path (glob 0.3 with default options: `*` and `?` also match `/`,
+/// case-sensitive), where no wildcard or class crosses into the query string or fragment.
+fn glob_to_url_regex(glob: &str, raw: &str) -> Result<String> {
+    let chars: Vec<char> = glob.chars().collect();
+    let mut out = String::with_capacity(glob.len() * 2);
+    let mut i = 0usize;
+    while i < chars.len() {
+        match chars[i] {
+            '?' => {
+                out.push_str(&format!("(?:[^?#%]|{ENCODED_CHAR})"));
+                i += 1;
+            }
+            '*' if chars.get(i + 1) == Some(&'*') => {
+                // `**` is a whole path component (glob rejects anything else): `**/` matches zero
+                // or more directories, a trailing `**` anything.
+                i += 2;
+                if chars.get(i) == Some(&'/') {
+                    out.push_str("(?:[^?#]*/)?");
+                    i += 1;
+                } else {
+                    out.push_str("[^?#]*");
+                }
+            }
+            '*' => {
+                out.push_str("[^?#]*");
+                i += 1;
+            }
+            '[' => {
+                // As glob reads it: `[!` negates, and the first member may be `]`.
+                let negated = chars.get(i + 1) == Some(&'!');
+                let first = if negated { i + 2 } else { i + 1 };
+                let close = chars
+                    .get(first + 1..)
+                    .and_then(|rest| rest.iter().position(|c| *c == ']'))
+                    .map(|pos| first + 1 + pos)
+                    .ok_or_else(|| {
+                        VaultError::Validation(format!(
+                            "invalid glob pattern '{raw}': unclosed '['"
+                        ))
+                    })?;
+                out.push_str(&class_to_regex(&chars[first..close], negated, raw)?);
+                i = close + 1;
+            }
+            ch => {
+                out.push_str(&encoded_literal(ch));
+                i += 1;
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// One percent-encoded character: an encoded ASCII byte, or a UTF-8 lead byte and its
+/// continuation bytes.
+const ENCODED_CHAR: &str = "%[0-7][0-9A-Fa-f]|%[C-Fc-f][0-9A-Fa-f](?:%[89ABab][0-9A-Fa-f]){1,3}";
+
+/// A glob character class (`a`, `a-z`; a reversed range matches nothing) as a regex for one
+/// character of a percent-encoded path, never `?` or `#`. A member the path encodes is matched in
+/// its encoded form; a negated class or a range cannot express that and is rejected.
+fn class_to_regex(members: &[char], negated: bool, raw: &str) -> Result<String> {
+    let unsupported = |what: String| {
+        VaultError::Validation(format!(
+            "pattern '{raw}': {what} cannot match a percent-encoded URL path character by character"
+        ))
+    };
+    let escape = |ch: char| regex::escape(ch.encode_utf8(&mut [0u8; 4]));
+    let mut set = String::new();
+    let mut encoded = Vec::new();
+    let mut i = 0usize;
+    while i < members.len() {
+        if i + 2 < members.len() && members[i + 1] == '-' {
+            let (lo, hi) = (members[i], members[i + 2]);
+            if lo <= hi {
+                if (lo..=hi).any(encoded_in_path) {
+                    return Err(unsupported(format!("the range '{lo}-{hi}'")));
+                }
+                set.push_str(&format!("{}-{}", escape(lo), escape(hi)));
+            }
+            i += 3;
+        } else {
+            let ch = members[i];
+            if encoded_in_path(ch) {
+                if negated {
+                    return Err(unsupported(format!("the negated class member '{ch}'")));
+                }
+                encoded.push(encoded_literal(ch));
+            } else {
+                set.push_str(&escape(ch));
+            }
+            i += 1;
+        }
+    }
+    if negated {
+        return Ok(format!("(?:[^?#%{set}]|{ENCODED_CHAR})"));
+    }
+    let mut alternatives = encoded;
+    if !set.is_empty() {
+        alternatives.insert(0, format!("[[{set}]&&[^?#]]"));
+    }
+    Ok(match alternatives.len() {
+        0 => NO_CHAR.to_string(),
+        _ => format!("(?:{})", alternatives.join("|")),
+    })
 }
 
 /// The record of one web Sync, logged as one `web_sync_summary` line when the Sync ends: the page
@@ -396,8 +582,6 @@ fn web_origin_and_scope(source: &SourceRecord) -> Result<(Url, WebScope)> {
     }
 
     let scope = WebScope::new(&origin, &source.include_patterns, &source.exclude_patterns)?;
-    // Touch matcher field to verify pattern compilation cleanly up front.
-    let _ = &scope.matcher;
     Ok((origin, scope))
 }
 
@@ -1016,109 +1200,314 @@ fn normalize_prefix(path: &str) -> String {
     }
 }
 
-fn matches_url_prefix(prefix: &str, candidate_path: &str) -> bool {
-    if prefix == "/" {
-        return true;
+#[cfg(test)]
+mod scope_tests {
+    use spider::website::ProcessLinkStatus;
+    use spider::CaseInsensitiveString;
+
+    use super::{configure_website, Url, WebScope};
+
+    /// One scope row: which patterns, which URL, and whether the URL is stored and crawled.
+    struct Row {
+        origin: &'static str,
+        includes: &'static [&'static str],
+        excludes: &'static [&'static str],
+        url: &'static str,
+        store: bool,
+        crawl: bool,
     }
-    let clean_candidate = candidate_path.trim_end_matches('/');
-    clean_candidate == prefix
-        || candidate_path == prefix
-        || candidate_path.starts_with(&format!("{prefix}/"))
-}
 
-fn is_static_asset_url(url: &Url) -> bool {
-    let Some(last) = url.path_segments().and_then(|mut s| s.next_back()) else {
-        return false;
-    };
-    let Some((_, ext)) = last.rsplit_once('.') else {
-        return false;
-    };
-    STATIC_ASSET_EXTENSIONS
-        .iter()
-        .any(|known| ext.eq_ignore_ascii_case(known))
-}
+    const ROOT: &str = "https://ex.com/";
+    const GUIDE: &str = "https://ex.com/guide/";
 
-fn escape_regex_literal(raw: &str) -> String {
-    let mut out = String::with_capacity(raw.len());
-    for ch in raw.chars() {
-        if matches!(
-            ch,
-            '\\' | '.' | '+' | '*' | '?' | '(' | ')' | '|' | '[' | ']' | '{' | '}' | '^' | '$'
-        ) {
-            out.push('\\');
+    const fn row(
+        origin: &'static str,
+        includes: &'static [&'static str],
+        excludes: &'static [&'static str],
+        url: &'static str,
+        store: bool,
+        crawl: bool,
+    ) -> Row {
+        Row {
+            origin,
+            includes,
+            excludes,
+            url,
+            store,
+            crawl,
         }
-        out.push(ch);
     }
-    out
-}
 
-fn glob_to_regex(raw: &str) -> String {
-    let mut out = String::with_capacity(raw.len());
-    let chars: Vec<char> = raw.chars().collect();
-    let mut i = 0usize;
-    while i < chars.len() {
-        match chars[i] {
-            '*' => out.push_str(".*"),
-            '?' => out.push('.'),
-            '[' => {
-                if let Some(close_rel) = chars[i + 1..].iter().position(|c| *c == ']') {
-                    out.push('[');
-                    for ch in &chars[i + 1..=i + 1 + close_rel] {
-                        out.push(*ch);
-                    }
-                    i += 1 + close_rel + 1;
+    #[rustfmt::skip]
+    const ROWS: &[Row] = &[
+        // Controls: the prefix scope and the asset rule block these.
+        row(GUIDE, &[], &[], "https://ex.com/guide/a", true, true),
+        row(GUIDE, &[], &[], "https://ex.com/other", false, false),
+        row(ROOT, &[], &[], "https://ex.com/img/logo.png", false, false),
+        row(ROOT, &[], &[], "https://other.com/a", false, false),
+        // 1. A glob matches the whole path: `docs/*.md` is not `docs/*.mdx`.
+        row(ROOT, &["docs/*.md"], &[], "https://ex.com/docs/x.md", true, true),
+        row(ROOT, &["docs/*.md"], &[], "https://ex.com/docs/x.md?v=1", true, true),
+        row(ROOT, &["docs/*.md"], &[], "https://ex.com/docs/x.mdx", false, false),
+        row(ROOT, &[], &["docs/*.md"], "https://ex.com/docs/x.mdx", true, true),
+        row(ROOT, &["docs/v?"], &[], "https://ex.com/docs/v1", true, true),
+        row(ROOT, &["docs/v?"], &[], "https://ex.com/docs/v12", false, false),
+        // 2. `[!x]` is negation; `[^x]` is the set {^, x} in glob.
+        row(ROOT, &["docs/[!d]*"], &[], "https://ex.com/docs/api", true, true),
+        row(ROOT, &["docs/[!d]*"], &[], "https://ex.com/docs/draft", false, false),
+        row(ROOT, &["docs/[^a]*"], &[], "https://ex.com/docs/api", true, true),
+        row(ROOT, &["docs/[^a]*"], &[], "https://ex.com/docs/bpi", false, false),
+        row(ROOT, &["docs/[]a]*"], &[], "https://ex.com/docs/api", true, true),
+        row(ROOT, &["docs/[]a]*"], &[], "https://ex.com/docs/bpi", false, false),
+        // A reversed range matches nothing in glob; it must not drop the whole regex set.
+        row(ROOT, &["docs/[z-a]*"], &[], "https://ex.com/blog/a", false, false),
+        row(ROOT, &[], &["docs/[z-a]*"], "https://ex.com/img/a.png", false, false),
+        row(ROOT, &[], &["docs/[z-a]*"], "https://ex.com/docs/a", true, true),
+        // 3. One static-asset rule: case-insensitive, on the path only.
+        row(ROOT, &[], &[], "https://ex.com/img/LOGO.PNG", false, false),
+        row(ROOT, &[], &[], "https://ex.com/page?file=a.png", true, true),
+        row(ROOT, &[], &[], "https://ex.com/img/a.png#top", false, false),
+        // `**/` matches zero or more directories; a trailing `**` anything below.
+        row(ROOT, &["docs/**/x"], &[], "https://ex.com/docs/x", true, true),
+        row(ROOT, &["docs/**/x"], &[], "https://ex.com/docs/a/b/x", true, true),
+        row(ROOT, &["docs/**/x"], &[], "https://ex.com/docs/ax", false, false),
+        row(ROOT, &["docs/**"], &[], "https://ex.com/docs/a/b", true, true),
+        row(ROOT, &["docs/**"], &[], "https://ex.com/docs", false, false),
+        // Wildcards stop at the query string.
+        row(ROOT, &["docs/*.md"], &[], "https://ex.com/docs/a?x=.md", false, false),
+        // Relative patterns match the path, not the host.
+        row("https://docs.ex.com/", &["*docs*"], &[], "https://docs.ex.com/other", false, false),
+        // Prefix patterns: whole segments, any query.
+        row(ROOT, &["docs/"], &[], "https://ex.com/docs", true, true),
+        row(ROOT, &["docs/"], &[], "https://ex.com/docs/a", true, true),
+        row(ROOT, &["docs/"], &[], "https://ex.com/docsx", false, false),
+        row(ROOT, &["https://ex.com/docs"], &[], "https://ex.com/docs?x=1", true, true),
+        row(ROOT, &["https://ex.com/docs/*"], &[], "https://ex.com/docs/a", true, true),
+        // Origin-relative and root-relative forms of a relative pattern.
+        row(GUIDE, &["intro*"], &[], "https://ex.com/guide/intro-1", true, true),
+        row(GUIDE, &["intro*"], &[], "https://ex.com/intro-1", true, true),
+        row(GUIDE, &["intro*"], &[], "https://ex.com/guide/other", false, false),
+        row(GUIDE, &[], &["intro*"], "https://ex.com/guide/intro-1", false, false),
+        // Patterns are case-sensitive.
+        row(ROOT, &["Docs/*"], &[], "https://ex.com/docs/a", false, false),
+        // The Origin page is crawled for its links even when no include stores it.
+        row(ROOT, &["docs/*"], &[], "https://ex.com/", false, true),
+        // Patterns match the percent-encoded URL; their literal characters are encoded the same way.
+        row(ROOT, &["my docs/*"], &[], "https://ex.com/my%20docs/a", true, true),
+        row(ROOT, &["docs/é*"], &[], "https://ex.com/docs/%C3%A9a", true, true),
+        row(ROOT, &["docs/v?"], &[], "https://ex.com/docs/v%C3%A9", true, true),
+        row(ROOT, &["docs/[^a]*"], &[], "https://ex.com/docs/%5Ex", true, true),
+        row(ROOT, &["docs/my%20*"], &[], "https://ex.com/docs/my%20a", true, true),
+        row(ROOT, &["docs/é*"], &[], "https://ex.com/docs/%c3%a9a", true, true),
+        // `=` or `&` after a `?` in a later segment is a path character, not a query string.
+        row(ROOT, &["wiki/v?/a=b"], &[], "https://ex.com/wiki/v1/a=b", true, true),
+        // An absolute pattern's scheme and host are case-insensitive; a default port is implied.
+        row(ROOT, &["HTTPS://Ex.com/docs"], &[], "https://ex.com/docs/a", true, true),
+        row(ROOT, &["https://ex.com:443/docs/*"], &[], "https://ex.com/docs/a", true, true),
+    ];
+
+    /// Whether spider's own allow-list check admits `url` for a crawler configured from `scope`,
+    /// and which of its compiled sets ("whitelist", "blacklist") came out empty: spider silently
+    /// drops a set that fails to compile.
+    fn spider_admits(origin: &Url, scope: &WebScope, url: &str) -> (bool, Vec<&'static str>) {
+        let mut site = configure_website(origin, scope, 100, 10, false);
+        site.configuration.configure_allowlist();
+        let mut dropped = Vec::new();
+        if site.configuration.get_whitelist_compiled().is_empty() {
+            dropped.push("whitelist");
+        }
+        if site.configuration.get_blacklist_compiled().is_empty() {
+            dropped.push("blacklist");
+        }
+        let status = site.is_allowed_default(&CaseInsensitiveString::from(url));
+        (status == ProcessLinkStatus::Allowed, dropped)
+    }
+
+    #[test]
+    fn crawl_and_store_filters_agree() {
+        let mut failures = Vec::new();
+        for r in ROWS {
+            let origin = Url::parse(r.origin).expect("origin");
+            let includes: Vec<String> = r.includes.iter().map(|s| s.to_string()).collect();
+            let excludes: Vec<String> = r.excludes.iter().map(|s| s.to_string()).collect();
+            let scope = match WebScope::new(&origin, &includes, &excludes) {
+                Ok(scope) => scope,
+                Err(err) => {
+                    failures.push(format!(
+                        "{:?} {:?} {}: scope error {err}",
+                        r.includes, r.excludes, r.url
+                    ));
                     continue;
                 }
-                out.push_str(r"\[");
+            };
+            let url = Url::parse(r.url).expect("url");
+            let store = scope.should_store(&url);
+            let (crawl, dropped) = spider_admits(&origin, &scope, r.url);
+            if store != r.store || crawl != r.crawl || !dropped.is_empty() {
+                failures.push(format!(
+                    "inc={:?} exc={:?} {} -> store {store} (want {}), crawl {crawl} (want {}), spider dropped {dropped:?}",
+                    r.includes, r.excludes, r.url, r.store, r.crawl
+                ));
             }
-            ch if matches!(
-                ch,
-                '\\' | '.' | '+' | '(' | ')' | '|' | ']' | '{' | '}' | '^' | '$'
-            ) =>
-            {
-                out.push('\\');
-                out.push(ch);
+            if store && !crawl {
+                failures.push(format!("  ^ storable but never crawled: {}", r.url));
             }
-            ch => out.push(ch),
         }
-        i += 1;
-    }
-    out
-}
-
-fn pattern_to_url_regexes(authority_re: &str, origin_prefix: &str, raw_pat: &str) -> Vec<String> {
-    let trimmed = raw_pat.trim();
-    if trimmed.is_empty() {
-        return Vec::new();
-    }
-    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
-        let body = if trimmed.contains(['*', '?', '[']) {
-            glob_to_regex(trimmed)
-        } else {
-            format!(
-                "{}(/|$|\\?|#)",
-                escape_regex_literal(trimmed.trim_end_matches('/'))
-            )
-        };
-        return vec![format!("^{body}")];
+        assert!(
+            failures.is_empty(),
+            "{} scope rows disagree:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
     }
 
-    let rel = trimmed.trim_start_matches("./").trim_start_matches('/');
-    let suffix_re = if rel.contains(['*', '?', '[']) {
-        glob_to_regex(rel)
-    } else {
-        format!(
-            "{}(/|$|\\?|#)",
-            escape_regex_literal(rel.trim_end_matches('/'))
-        )
-    };
-
-    let mut out = vec![format!(r"^{authority_re}/{suffix_re}")];
-    if origin_prefix != "/" {
-        let prefix_escaped = escape_regex_literal(origin_prefix);
-        out.push(format!(r"^{authority_re}{prefix_escaped}/{suffix_re}"));
+    /// A relative pattern's regex, run on the percent-encoded path a real URL has, means what
+    /// `glob::Pattern::matches` means on the decoded path.
+    #[test]
+    fn relative_pattern_regex_matches_like_glob() {
+        let patterns = [
+            "docs/*",
+            "docs/*.md",
+            "*.md",
+            "docs/v?",
+            "?ocs/*",
+            "docs/**",
+            "docs/**/x",
+            "**/x",
+            "**",
+            "a/**/**/b",
+            "docs/[!d]*",
+            "docs/[^a]*",
+            "docs/[]a]*",
+            "docs/[!]a]*",
+            "docs/[a-c]*",
+            "docs/[z-a]*",
+            "docs/[z-ab]*",
+            "docs/[!z-a]*",
+            "docs/[a-]*",
+            "docs/[-a]*",
+            "docs/[.]*",
+            "docs/[*]x",
+            "d.cs/(x)|+{1}$^",
+            "docs/[\\d]*",
+            "docs/[a&&b]*",
+            "docs/[~~]*",
+            "Docs/*",
+            "docs/é*",
+            "docs/*/index",
+            "my docs/*",
+            "docs/?",
+            "docs/??",
+            "docs/[!a]",
+            "docs/[!a]*",
+            "docs/[é]x",
+            "docs/[{a]x",
+        ];
+        let paths = [
+            "docs",
+            "docs/",
+            "docs/x.md",
+            "docs/x.mdx",
+            "docs/a/x.md",
+            "x.md",
+            "docs/v1",
+            "docs/v12",
+            "docs/a/b",
+            "docs/x",
+            "docs/a/b/x",
+            "docs/ax",
+            "x",
+            "a/x",
+            "a/b",
+            "a/c/b",
+            "a//b",
+            "docs/api",
+            "docs/draft",
+            "docs/bpi",
+            "docs/^x",
+            "docs/]x",
+            "docs/b",
+            "docs/z",
+            "docs/-x",
+            "docs/.x",
+            "docs/*x",
+            "docs/ax",
+            "d.cs/(x)|+{1}$^",
+            "docs/dx",
+            "docs/&x",
+            "docs/~x",
+            "Docs/a",
+            "docs/éa",
+            "docs/é",
+            "docs/éé",
+            "docs/ x",
+            "docs/{x",
+            "docs/a",
+            "my docs/a",
+            "docs/a/index",
+            "docs/a/b/index",
+            "",
+        ];
+        let mut failures = Vec::new();
+        for pattern in patterns {
+            let glob = glob::Pattern::new(pattern).expect("valid glob");
+            let super::UrlPattern::Relative(body) =
+                super::UrlPattern::parse(pattern).expect("parse")
+            else {
+                panic!("{pattern} parsed as absolute");
+            };
+            let regex = regex::Regex::new(&format!("^{body}")).expect("regex");
+            for path in paths {
+                let mut url = Url::parse(ROOT).expect("root");
+                url.set_path(path);
+                let encoded = url.path().trim_start_matches('/');
+                let (by_glob, by_regex) = (glob.matches(path), regex.is_match(encoded));
+                if by_glob != by_regex {
+                    failures.push(format!(
+                        "{pattern} on {path:?} ({encoded}): glob {by_glob}, regex {by_regex}"
+                    ));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
-    out
+
+    #[test]
+    fn patterns_glob_rejects_are_validation_errors() {
+        let origin = Url::parse(ROOT).expect("origin");
+        for bad in [
+            "docs/**x",
+            "a***",
+            "docs/[",
+            "docs/[!]",
+            "  ",
+            "/",
+            // A query string: patterns match the path only.
+            "https://ex.com/search?q=rust",
+            "search?q=*",
+            "list?a=1&b=*",
+            "docs/v?/x?q=1",
+            // A fragment: patterns match the path only.
+            "docs/page#intro",
+            "https://ex.com/docs#*",
+            "docs/*#",
+            "#top",
+            // Classes that a percent-encoded path cannot express as one character.
+            "docs/[!é]*",
+            "docs/[ -~]*",
+        ] {
+            let err = WebScope::new(&origin, &[bad.to_string()], &[]).expect_err(bad);
+            assert!(
+                matches!(err, crate::error::VaultError::Validation(_)),
+                "{bad}: {err}"
+            );
+            let err = super::validate_scope_patterns(ROOT, &[], &[bad.to_string()]).expect_err(bad);
+            assert!(
+                matches!(err, crate::error::VaultError::Validation(_)),
+                "{bad}: {err}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2498,6 +2887,76 @@ setTimeout(function () {{
             )
             .expect("archived row");
         assert_eq!(status, "active");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn crawl_fetches_only_what_the_patterns_store() {
+        let state = FixtureState::default();
+        state.set_html(
+            "/",
+            StatusCode::OK,
+            r#"<html><body><main><h1>Home</h1><p><a href="/docs/api">API</a> <a href="/docs/draft">Draft</a> <a href="/guide/x.md">MD</a> <a href="/guide/x.mdx">MDX</a> <a href="/img/LOGO.PNG">Logo</a></p></main></body></html>"#,
+        );
+        for path in [
+            "/docs/api",
+            "/docs/draft",
+            "/guide/x.md",
+            "/guide/x.mdx",
+            "/img/LOGO.PNG",
+        ] {
+            state.set_html(
+                path,
+                StatusCode::OK,
+                &format!("<html><body><main><h1>{path}</h1><p>Page.</p></main></body></html>"),
+            );
+        }
+        let requests = state.requests.clone();
+        let (addr, server_handle) = spawn_fixture_server(state).await;
+        let vault_dir = tempdir().expect("vault tempdir");
+        let cfg = VaultConfig::new(vault_dir.path()).allowing_private_origins();
+
+        let Added { source, .. } = SourceLifecycle::new(cfg.clone())
+            .add(
+                AddSourceParams {
+                    origin: format!("http://{addr}/"),
+                    include_patterns: vec!["docs/[!d]*".to_string(), "guide/*.md".to_string()],
+                    ..Default::default()
+                },
+                true,
+            )
+            .await
+            .expect("add and sync");
+
+        let conn = open_rw_db(&cfg.db_path()).expect("open_rw_db");
+        let uris: Vec<String> = conn
+            .prepare("SELECT uri FROM pages WHERE source_id = ?1 ORDER BY uri")
+            .expect("prepare")
+            .query_map([source.id], |r| r.get(0))
+            .expect("query")
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .expect("collect");
+        assert_eq!(
+            uris,
+            vec![
+                format!("http://{addr}/docs/api"),
+                format!("http://{addr}/guide/x.md")
+            ]
+        );
+
+        let mut fetched: Vec<String> = requests
+            .read()
+            .expect("lock requests")
+            .iter()
+            .map(|(path, _, _)| path.clone())
+            .filter(|path| path != "/" && !path.ends_with(".txt") && !path.ends_with(".xml"))
+            .collect();
+        fetched.sort();
+        assert_eq!(
+            fetched,
+            vec!["/docs/api", "/guide/x.md"],
+            "out-of-scope fetches"
+        );
+        server_handle.abort();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

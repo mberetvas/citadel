@@ -483,6 +483,7 @@ dependencies = [
  "notify-debouncer-mini",
  "open",
  "pulldown-cmark",
+ "regex",
  "reqwest 0.12.28",
  "rusqlite",
  "rust-embed",
