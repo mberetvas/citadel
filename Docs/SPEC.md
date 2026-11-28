@@ -615,7 +615,7 @@ The `Makefile` drives Docker by default (`RUNTIME ?= docker`); Apple's macOS OCI
 - Each build packs `citadel-vX.Y.Z-<target>.tar.gz` with `citadel` at the root. A `publish` job (the only job with `contents: write`) writes `checksums.sha256` and runs `gh release create <tag> --generate-notes` with all assets.
 
 ### Release Process
-1. Bump `version` in `Cargo.toml` (and `Cargo.lock`) on a branch; merge it to `main` through the PR gate.
+1. Bump `version` in `Cargo.toml`, `Cargo.lock` and the README's `V=vX.Y.Z` install line (SemVer: fix → patch, feat → minor, breaking change → major), in the PR that changes the binary or on a release branch; merge it to `main` through the PR gate.
 2. `git tag vX.Y.Z && git push origin vX.Y.Z`.
 3. Check the Release page lists the four tarballs and `checksums.sha256`; `citadel update --check` on an older build reports the new version.
 
