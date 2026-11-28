@@ -2802,7 +2802,7 @@ setTimeout(function () {{
         server_handle.abort();
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn honors_max_pages_and_include_override() {
         let state = FixtureState::default();
         state.set_html(
