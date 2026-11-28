@@ -9,7 +9,7 @@ use url::Url;
 
 use crate::error::{Result, VaultError};
 use crate::ingest::local::PatternMatcher;
-use crate::ingest::persist::SyncPages;
+use crate::ingest::persist::{OnWritten, SyncPages};
 use crate::ingest::SourceRecord;
 use crate::sources::origin::is_private_host;
 
@@ -313,7 +313,7 @@ fn millis(duration: Duration) -> u64 {
 /// crawl fails, otherwise from `on_written` once the lifecycle has written the pages.
 pub(crate) async fn collect(source: &SourceRecord, prune: bool) -> Result<SyncPages> {
     let (origin, scope) = web_origin_and_scope(source)?;
-    let (result, mut acc) = collect_with_accounting(source, prune, &origin, &scope).await;
+    let (result, acc) = collect_with_accounting(source, prune, &origin, &scope).await;
     let mut pages = match result {
         Ok(pages) => pages,
         Err(err) => {
@@ -321,12 +321,17 @@ pub(crate) async fn collect(source: &SourceRecord, prune: bool) -> Result<SyncPa
             return Err(err);
         }
     };
-    let source = source.clone();
-    pages.on_written = Some(Box::new(move |ok, write| {
+    pages.on_written = Some(log_after_write(source.clone(), acc));
+    Ok(pages)
+}
+
+/// The `on_written` hook of a web Sync: log its `web_sync_summary` line, with `ok` and
+/// `write_ms` for the write, once the lifecycle has written the pages (or failed to).
+fn log_after_write(source: SourceRecord, mut acc: WebSyncAccounting) -> OnWritten {
+    Box::new(move |ok, write| {
         acc.write_ms = Some(millis(write));
         log_web_sync_summary(&source, ok, &acc);
-    }));
-    Ok(pages)
+    })
 }
 
 /// Crawl a checked web Source and return its pages with the accounting record so far.
@@ -2371,6 +2376,50 @@ setTimeout(function () {{
                 + acc.pages.binary_file,
             "{acc:?}"
         );
+    }
+
+    /// The `web_sync_summary` line a web Sync's `on_written` hook logs for a write.
+    fn summary_line_after_write(site: &UnsyncedSite, ok: bool, took: Duration) -> String {
+        #[derive(Clone, Default)]
+        struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Captured {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("capture lock").extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        let hook = super::log_after_write(site.source.clone(), super::WebSyncAccounting::default());
+        tracing::subscriber::with_default(subscriber, || hook(ok, took));
+        let bytes = captured.0.lock().expect("capture lock").clone();
+        String::from_utf8(bytes).expect("utf-8 log")
+    }
+
+    #[tokio::test]
+    async fn summary_line_after_the_write_carries_ok_and_write_ms() {
+        let site = add_unsynced_docs_source(
+            &FixtureState::default(),
+            AddSourceParams {
+                name: Some("logged".to_string()),
+                ..Default::default()
+            },
+        )
+        .await;
+        site.server.abort();
+        for (ok, expected) in [(true, "ok=true"), (false, "ok=false")] {
+            let line = summary_line_after_write(&site, ok, Duration::from_millis(7));
+            assert!(line.contains("web_sync_summary"), "{line}");
+            assert!(line.contains(expected), "{line}");
+            assert!(line.contains("write_ms=7"), "{line}");
+        }
     }
 
     #[test]
