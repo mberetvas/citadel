@@ -5,6 +5,7 @@
 //! returned here never block a runtime worker and are `Send`.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -14,15 +15,20 @@ use crate::config::VaultConfig;
 use crate::db::open_rw_db;
 use crate::error::{Result, VaultError};
 use crate::ingest::{
-    load_all_sources, load_source_by_id, load_source_by_name, local, sync_local_source,
-    sync_web_source, SourceKind, SourceRecord, SyncSummary, DEFAULT_MAX_DEPTH, DEFAULT_MAX_PAGES,
+    load_all_sources, load_source_by_id, load_source_by_name, local, SourceKind, SourceRecord,
+    SyncSummary, DEFAULT_MAX_DEPTH, DEFAULT_MAX_PAGES,
 };
 
 mod claim;
+mod driver;
 pub(crate) mod origin;
 mod sync;
+mod sync_run;
 
 use claim::{ClaimEnv, ClaimGuard};
+#[cfg(test)]
+pub(crate) use driver::FakeDriver;
+use driver::{OriginDriver, SyncDriver};
 
 use origin::{check_private_origin, classify_origin};
 use sync::Target;
@@ -37,6 +43,8 @@ const MAX_ALLOWED_DEPTH: u32 = 20;
 pub struct SourceLifecycle {
     config: VaultConfig,
     claims: ClaimEnv,
+    /// How each Sync fetches its pages.
+    driver: Arc<dyn SyncDriver>,
     probe: Probe,
 }
 
@@ -45,13 +53,15 @@ pub struct SourceLifecycle {
 pub(crate) enum Stage {
     /// The Source row was loaded; no claim taken yet.
     Loaded,
-    /// The Sync claim row is committed.
+    /// The Sync claim row is committed and the Sync run is not yet open.
     Claimed,
+    /// The driver collected the pages; they are about to be written.
+    Writing,
 }
 
 /// Test seam: called synchronously at each [`Stage`]. Always empty in production.
 #[derive(Clone, Default)]
-struct Probe(Option<std::sync::Arc<dyn Fn(Stage) + Send + Sync>>);
+struct Probe(Option<Arc<dyn Fn(Stage) + Send + Sync>>);
 
 impl Probe {
     fn at(&self, stage: Stage) {
@@ -113,17 +123,28 @@ impl SyncOutcome {
 
 impl SourceLifecycle {
     pub fn new(config: VaultConfig) -> Self {
+        let driver = Arc::new(OriginDriver {
+            allow_private_origins: config.allow_private_origins,
+        });
         Self {
             config,
             claims: ClaimEnv::current(),
+            driver,
             probe: Probe::default(),
         }
+    }
+
+    /// Fetch pages with `driver` instead of walking folders and crawling the web.
+    #[cfg(test)]
+    pub(crate) fn with_driver(mut self, driver: impl SyncDriver + 'static) -> Self {
+        self.driver = Arc::new(driver);
+        self
     }
 
     /// Pause points for tests: `probe` runs synchronously at every [`Stage`].
     #[cfg(test)]
     pub(crate) fn with_probe(mut self, probe: impl Fn(Stage) + Send + Sync + 'static) -> Self {
-        self.probe = Probe(Some(std::sync::Arc::new(probe)));
+        self.probe = Probe(Some(Arc::new(probe)));
         self
     }
 
@@ -249,63 +270,6 @@ impl SourceLifecycle {
         })
         .await
     }
-
-    /// Run one Sync of a claimed Source. Any failure, whether before or during the walk
-    /// or crawl, leaves the same trace: an error Sync run and `status = 'error'`.
-    async fn sync_record(&self, source: &SourceRecord, prune: bool) -> Result<SyncSummary> {
-        let config = self.config.clone();
-        let id = source.id;
-        let last_run_before = blocking(move || {
-            let conn = open_rw_db(&config.db_path())?;
-            Ok(conn.query_row(
-                "SELECT COALESCE(MAX(id), 0) FROM sync_runs WHERE source_id = ?1",
-                [id],
-                |r| r.get::<_, i64>(0),
-            )?)
-        })
-        .await?;
-
-        let result = self.run_sync(source, prune).await;
-        if let Err(err) = &result {
-            let config = self.config.clone();
-            let message = err.to_string();
-            let recorded = blocking(move || {
-                let conn = open_rw_db(&config.db_path())?;
-                record_sync_failure(&conn, id, last_run_before, &message)
-            })
-            .await;
-            if let Err(record_err) = recorded {
-                tracing::warn!(source = %source.name, error = %record_err, "failed to record sync failure");
-            }
-        }
-        result
-    }
-
-    async fn run_sync(&self, source: &SourceRecord, prune: bool) -> Result<SyncSummary> {
-        match source.kind {
-            SourceKind::Local => {
-                let config = self.config.clone();
-                let src = source.clone();
-                blocking(move || {
-                    let mut conn = open_rw_db(&config.db_path())?;
-                    sync_local_source(
-                        &mut conn,
-                        src.id,
-                        &src.name,
-                        Path::new(&src.origin),
-                        &src.include_patterns,
-                        &src.exclude_patterns,
-                        prune,
-                    )
-                })
-                .await
-            }
-            SourceKind::Web => {
-                check_private_origin(&source.origin, self.config.allow_private_origins)?;
-                sync_web_source(&self.config.db_path(), source, prune).await
-            }
-        }
-    }
 }
 
 /// Run blocking work (SQLite, folder walks) on Tokio's blocking pool.
@@ -413,35 +377,6 @@ fn register_source_row(config: &VaultConfig, params: AddSourceParams) -> Result<
 
     let source_id = conn.last_insert_rowid();
     load_source_by_id(&conn, source_id)
-}
-
-/// Record a failed Sync: close the Sync run it started (or add one if it failed before
-/// starting one) and mark the Source as errored.
-fn record_sync_failure(
-    conn: &Connection,
-    source_id: i64,
-    last_run_before: i64,
-    message: &str,
-) -> Result<()> {
-    conn.execute(
-        "UPDATE sync_runs
-         SET status = 'error', error_message = ?2,
-             finished_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
-         WHERE source_id = ?1 AND status = 'running'",
-        params![source_id, message],
-    )?;
-    conn.execute(
-        "INSERT INTO sync_runs (source_id, started_at, finished_at, status, error_message)
-         SELECT ?1, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
-                'error', ?3
-         WHERE NOT EXISTS (SELECT 1 FROM sync_runs WHERE source_id = ?1 AND id > ?2)",
-        params![source_id, last_run_before, message],
-    )?;
-    conn.execute(
-        "UPDATE sources SET status = 'error', last_error = ?2 WHERE id = ?1",
-        params![source_id, message],
-    )?;
-    Ok(())
 }
 
 fn validate_source_limits(

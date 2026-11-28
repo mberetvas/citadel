@@ -19,8 +19,8 @@ use super::{
     resolve_seed_url, WebScope,
 };
 use crate::error::{Result, VaultError};
-use crate::ingest::local::{MissingPagePolicy, PageIngestOutcome};
 use crate::ingest::normalize::{count_words, normalize_markdown};
+use crate::ingest::persist::{MissingPagePolicy, PageIngestOutcome};
 use crate::ingest::sections::split_sections;
 
 /// Counts of the pages one web Sync's crawls delivered. When every crawl finishes, each page
@@ -1150,7 +1150,7 @@ mod tests {
 
     use super::{Collected, CollectedPages, LaterCrawl, PageCounts};
     use crate::error::Result;
-    use crate::ingest::local::{MissingPagePolicy, PageIngestOutcome};
+    use crate::ingest::persist::{MissingPagePolicy, PageIngestOutcome};
     use crate::ingest::web::{Page, Url, WebScope};
 
     fn scope() -> WebScope {
@@ -1767,7 +1767,7 @@ mod tests {
 
         use super::super::{build_page_outcomes, document_key, PageCounts};
         use super::{scope, typed_page};
-        use crate::ingest::local::PageIngestOutcome;
+        use crate::ingest::persist::PageIngestOutcome;
         use crate::ingest::web::{Page, Url};
 
         #[test]

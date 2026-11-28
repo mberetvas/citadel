@@ -742,3 +742,216 @@ async fn failed_page_write_records_one_error_run_for_web_and_local() {
     }
     server.abort();
 }
+
+/// A vault with one registered (unsynced) Source named `docs`, and a lifecycle on it.
+async fn vault_with_docs() -> (tempfile::TempDir, VaultConfig, SourceLifecycle) {
+    let vault_dir = tempdir().expect("vault tempdir");
+    let config = VaultConfig::new(vault_dir.path());
+    let lifecycle = SourceLifecycle::new(config.clone());
+    lifecycle
+        .add(
+            AddSourceParams {
+                origin: vault_dir.path().to_string_lossy().into_owned(),
+                name: Some("docs".into()),
+                ..Default::default()
+            },
+            false,
+        )
+        .await
+        .expect("register");
+    (vault_dir, config, lifecycle)
+}
+
+/// Wait until no Sync claim is left (a dropped guard releases on the blocking pool).
+async fn wait_for_no_claims(config: &VaultConfig) {
+    for _ in 0..100 {
+        if claim_rows(config) == 0 {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(claim_rows(config), 0, "the claim is released");
+}
+
+fn status_of(config: &VaultConfig, name: &str) -> String {
+    crate::ingest::show_source(config, name)
+        .expect("show")
+        .source
+        .status
+}
+
+#[tokio::test]
+async fn successful_sync_opens_and_closes_exactly_one_run() {
+    let (_vault, config, lifecycle) = vault_with_docs().await;
+    let fake = FakeDriver::one_page();
+    let summary = synced(
+        lifecycle
+            .clone()
+            .with_driver(fake.clone())
+            .sync("docs", false)
+            .await
+            .expect("sync"),
+    );
+    assert_eq!(summary.pages_added, 1);
+    assert_eq!(sync_runs(&config, "docs"), [("ok".to_string(), None, true)]);
+    assert_eq!(status_of(&config, "docs"), "ok");
+    assert_eq!(claim_rows(&config), 0);
+    assert_eq!(
+        fake.written(),
+        [true],
+        "the driver hears the write succeeded"
+    );
+}
+
+#[tokio::test]
+async fn driver_failure_records_one_error_run() {
+    let (_vault, config, lifecycle) = vault_with_docs().await;
+    let err = lifecycle
+        .with_driver(FakeDriver::failing("crawl broke"))
+        .sync("docs", false)
+        .await
+        .expect_err("driver fails");
+    assert!(err.to_string().contains("crawl broke"), "{err}");
+    assert_failure_recorded(&config, "docs");
+    assert_eq!(
+        sync_runs(&config, "docs"),
+        [("error".to_string(), Some("crawl broke".to_string()), true)]
+    );
+}
+
+#[tokio::test]
+async fn page_write_failure_records_one_error_run_and_tells_the_driver() {
+    let (_vault, config, lifecycle) = vault_with_docs().await;
+    break_page_writes(&config);
+    let fake = FakeDriver::one_page();
+    lifecycle
+        .with_driver(fake.clone())
+        .sync("docs", false)
+        .await
+        .expect_err("write fails");
+    assert_failure_recorded(&config, "docs");
+    assert_eq!(sync_runs(&config, "docs").len(), 1);
+    assert_eq!(fake.written(), [false], "the driver hears the write failed");
+}
+
+#[tokio::test]
+async fn driver_panic_releases_claim_and_closes_run() {
+    let (_vault, config, lifecycle) = vault_with_docs().await;
+    let err = lifecycle
+        .clone()
+        .with_driver(FakeDriver::panicking())
+        .sync("docs", false)
+        .await
+        .expect_err("driver panics");
+    assert!(err.to_string().contains("sync task failed"), "{err}");
+    wait_for_no_claims(&config).await;
+    assert_failure_recorded(&config, "docs");
+    assert_eq!(sync_runs(&config, "docs").len(), 1);
+
+    let next = lifecycle.with_driver(FakeDriver::one_page());
+    assert!(matches!(
+        next.sync("docs", false).await.expect("sync again"),
+        SyncOutcome::Synced(_)
+    ));
+}
+
+#[tokio::test]
+async fn failure_to_open_the_run_releases_the_claim() {
+    let (_vault, config, lifecycle) = vault_with_docs().await;
+    let conn = crate::db::open_rw_db(&config.db_path()).expect("open db");
+    conn.execute_batch(
+        "CREATE TRIGGER no_runs BEFORE INSERT ON sync_runs
+         BEGIN SELECT RAISE(ABORT, 'runs table is locked'); END;",
+    )
+    .expect("install trigger");
+    let lifecycle = lifecycle.with_driver(FakeDriver::one_page());
+
+    let err = lifecycle.sync("docs", false).await.expect_err("open fails");
+    assert!(err.to_string().contains("runs table is locked"), "{err}");
+    wait_for_no_claims(&config).await;
+    assert!(sync_runs(&config, "docs").is_empty());
+    assert_eq!(status_of(&config, "docs"), "idle", "nothing was started");
+
+    conn.execute_batch("DROP TRIGGER no_runs")
+        .expect("drop trigger");
+    assert!(matches!(
+        lifecycle.sync("docs", false).await.expect("sync"),
+        SyncOutcome::Synced(_)
+    ));
+}
+
+#[tokio::test]
+async fn missing_source_is_not_found_and_records_nothing() {
+    let (_vault, config, lifecycle) = vault_with_docs().await;
+    let err = lifecycle
+        .with_driver(FakeDriver::one_page())
+        .sync("nope", false)
+        .await
+        .expect_err("no such Source");
+    assert!(matches!(err, VaultError::NotFound(_)), "{err:?}");
+    assert!(sync_runs(&config, "docs").is_empty());
+    assert_eq!(claim_rows(&config), 0);
+}
+
+#[tokio::test]
+async fn second_start_while_a_sync_runs_is_already_syncing() {
+    let (_vault, config, lifecycle) = vault_with_docs().await;
+    let (fake, mut gate) = FakeDriver::one_page().gated();
+    let lifecycle = lifecycle.with_driver(fake);
+
+    // The UI's order: wait for the claim, reply 202, let the Sync run on.
+    let running = lifecycle
+        .start_sync("docs", false)
+        .claimed()
+        .await
+        .expect("claim")
+        .expect("first Sync takes the claim");
+    gate.reached().await;
+    assert!(
+        lifecycle
+            .start_sync("docs", false)
+            .claimed()
+            .await
+            .expect("claim")
+            .is_none(),
+        "a second request while the first runs is refused (UI: 409)"
+    );
+    gate.open();
+    assert_eq!(running.finish().await.expect("finish").pages_added, 1);
+    assert_eq!(sync_runs(&config, "docs").len(), 1);
+}
+
+/// Drop the caller while the Sync is inside the driver or writing, then let it go on: the
+/// Sync still finishes with one 'ok' run, and the claim is released.
+#[tokio::test]
+async fn sync_caller_dropped_during_driver_or_write_still_finishes() {
+    for at_write in [false, true] {
+        let (_vault, config, lifecycle) = vault_with_docs().await;
+        let (fake, mut driver_gate) = FakeDriver::one_page().gated();
+        let (lifecycle, mut write_gate) = Gate::at(lifecycle.with_driver(fake), Stage::Writing);
+
+        let gated = lifecycle.clone();
+        let caller = tokio::spawn(async move { gated.sync("docs", false).await });
+        driver_gate.reached().await;
+        if at_write {
+            driver_gate.open();
+            write_gate.reached().await;
+        }
+        caller.abort();
+        assert!(caller.await.expect_err("aborted").is_cancelled());
+        driver_gate.open();
+        write_gate.open();
+
+        assert_eq!(
+            wait_for_status(&config, "docs", "ok").await,
+            "ok",
+            "at_write={at_write}"
+        );
+        wait_for_no_claims(&config).await;
+        assert_eq!(
+            sync_runs(&config, "docs"),
+            [("ok".to_string(), None, true)],
+            "at_write={at_write}"
+        );
+    }
+}

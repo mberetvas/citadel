@@ -1,5 +1,4 @@
 use std::collections::HashSet;
-use std::path::Path;
 use std::time::Duration;
 
 use spider::compact_str::CompactString;
@@ -8,10 +7,10 @@ use spider::page::Page;
 use spider::website::Website;
 use url::Url;
 
-use crate::db::open_rw_db;
 use crate::error::{Result, VaultError};
-use crate::ingest::local::{fail_sync_run, persist_sync_outcomes, start_sync_run, PatternMatcher};
-use crate::ingest::{SourceRecord, SyncSummary};
+use crate::ingest::local::PatternMatcher;
+use crate::ingest::persist::SyncPages;
+use crate::ingest::SourceRecord;
 use crate::sources::origin::is_private_host;
 
 mod collected;
@@ -307,31 +306,45 @@ fn millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
-/// Synchronize a web documentation source using `spider` and `spider_transformations`.
-pub async fn sync_web_source(
-    db_path: &Path,
-    source: &SourceRecord,
-    prune: bool,
-) -> Result<SyncSummary> {
-    sync_web_source_with_accounting(db_path, source, prune)
-        .await
-        .0
+/// The web-crawl driver: crawl one web Source and collect its pages. It writes nothing; the
+/// Source lifecycle writes the pages and records the Sync run.
+///
+/// Every Sync whose Origin passes the checks logs one `web_sync_summary` line: here when the
+/// crawl fails, otherwise from `on_written` once the lifecycle has written the pages.
+pub(crate) async fn collect(source: &SourceRecord, prune: bool) -> Result<SyncPages> {
+    let (origin, scope) = web_origin_and_scope(source)?;
+    let (result, mut acc) = collect_with_accounting(source, prune, &origin, &scope).await;
+    let mut pages = match result {
+        Ok(pages) => pages,
+        Err(err) => {
+            log_web_sync_summary(source, false, &acc);
+            return Err(err);
+        }
+    };
+    let source = source.clone();
+    pages.on_written = Some(Box::new(move |ok, write| {
+        acc.write_ms = Some(millis(write));
+        log_web_sync_summary(&source, ok, &acc);
+    }));
+    Ok(pages)
 }
 
-/// Run a web Sync and return its accounting record with the result. Every Sync whose Origin
-/// passes the checks logs one `web_sync_summary` line, whether it succeeds or fails.
-pub(crate) async fn sync_web_source_with_accounting(
-    db_path: &Path,
+/// Crawl a checked web Source and return its pages with the accounting record so far.
+async fn collect_with_accounting(
     source: &SourceRecord,
     prune: bool,
-) -> (Result<SyncSummary>, WebSyncAccounting) {
+    origin: &Url,
+    scope: &WebScope,
+) -> (Result<SyncPages>, WebSyncAccounting) {
     let mut acc = WebSyncAccounting::default();
-    let (origin, scope) = match web_origin_and_scope(source) {
-        Ok(checked) => checked,
-        Err(err) => return (Err(err), acc),
-    };
-    let result = sync_checked_web_source(db_path, source, prune, &origin, &scope, &mut acc).await;
-    log_web_sync_summary(source, result.is_ok(), &acc);
+    let result = execute_web_crawl(source, origin, scope, prune, &mut acc)
+        .await
+        .map(|collected| SyncPages {
+            outcomes: collected.outcomes,
+            missing_policy: collected.missing_policy,
+            warnings: collected.warnings,
+            on_written: None,
+        });
     (result, acc)
 }
 
@@ -381,43 +394,6 @@ fn web_origin_and_scope(source: &SourceRecord) -> Result<(Url, WebScope)> {
     // Touch matcher field to verify pattern compilation cleanly up front.
     let _ = &scope.matcher;
     Ok((origin, scope))
-}
-
-async fn sync_checked_web_source(
-    db_path: &Path,
-    source: &SourceRecord,
-    prune: bool,
-    origin: &Url,
-    scope: &WebScope,
-    acc: &mut WebSyncAccounting,
-) -> Result<SyncSummary> {
-    let run_id = {
-        let conn = open_rw_db(db_path)?;
-        start_sync_run(&conn, source.id)?
-    };
-
-    let crawl_res = execute_web_crawl(source, origin, scope, prune, acc).await;
-
-    let mut conn = open_rw_db(db_path)?;
-    match crawl_res {
-        Ok(collected) => {
-            let write_start = std::time::Instant::now();
-            let persisted = persist_sync_outcomes(
-                &mut conn,
-                source.id,
-                &source.name,
-                run_id,
-                collected.outcomes,
-                collected.missing_policy,
-                collected.warnings,
-            );
-            finish_step(&mut acc.write_ms, write_start, persisted)
-        }
-        Err(err) => {
-            fail_sync_run(&conn, source.id, run_id, &err.to_string());
-            Err(err)
-        }
-    }
 }
 
 async fn execute_web_crawl(
@@ -1158,6 +1134,7 @@ mod tests {
 
     use crate::config::VaultConfig;
     use crate::db::open_rw_db;
+    use crate::ingest::persist::SyncPages;
     use crate::ingest::SourceKind;
     use crate::sources::{AddSourceParams, Added, SourceLifecycle};
 
@@ -2298,10 +2275,27 @@ setTimeout(function () {{
             .collect()
     }
 
+    /// Crawl a web Source and keep the accounting record a production Sync logs.
+    async fn collect_accounted(
+        source: &crate::ingest::SourceRecord,
+    ) -> (crate::error::Result<SyncPages>, super::WebSyncAccounting) {
+        let (origin, scope) = super::web_origin_and_scope(source).expect("checked origin");
+        super::collect_with_accounting(source, false, &origin, &scope).await
+    }
+
+    /// Write crawled pages the way a Sync does: through the Source lifecycle.
+    async fn write_collected(site: &UnsyncedSite, pages: SyncPages) -> crate::ingest::SyncSummary {
+        SourceLifecycle::new(site.cfg.clone())
+            .with_driver(crate::sources::FakeDriver::returning(pages))
+            .sync(&site.source.name, false)
+            .await
+            .expect("sync")
+            .synced()
+            .expect("synced")
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn accounting_times_every_step_and_counts_later_crawls() {
-        use super::sync_web_source_with_accounting;
-
         let state = FixtureState::default();
         state.set_html(
             "/docs/",
@@ -2344,10 +2338,9 @@ setTimeout(function () {{
             ),
         );
 
-        let (result, acc) =
-            sync_web_source_with_accounting(&site.cfg.db_path(), &site.source, false).await;
+        let (pages, acc) = collect_accounted(&site.source).await;
         site.server.abort();
-        let summary = result.expect("sync succeeds");
+        let summary = write_collected(&site, pages.expect("crawl succeeds")).await;
         let requests = state.requests.read().expect("lock requests").clone();
 
         assert_eq!(acc.pages.later_crawls_started, 2, "{acc:?}\n{requests:?}");
@@ -2360,7 +2353,6 @@ setTimeout(function () {{
             ("first_crawl_ms", acc.first_crawl_ms),
             ("later_crawls_ms", acc.later_crawls_ms),
             ("conversion_ms", acc.conversion_ms),
-            ("write_ms", acc.write_ms),
         ] {
             assert!(value.is_some(), "{step} not set: {acc:?}");
         }
@@ -2398,8 +2390,6 @@ setTimeout(function () {{
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cut_off_sync_with_dropped_page_marks_nothing_stale() {
-        use super::sync_web_source_with_accounting;
-
         let state = FixtureState::default();
         state.set_html(
             "/docs/",
@@ -2438,10 +2428,9 @@ setTimeout(function () {{
         .expect("insert archived active page");
         drop(conn);
 
-        let (result, acc) =
-            sync_web_source_with_accounting(&cfg.db_path(), &site.source, false).await;
+        let (pages, acc) = collect_accounted(&site.source).await;
         site.server.abort();
-        let summary = result.expect("sync succeeds");
+        let summary = write_collected(&site, pages.expect("crawl succeeds")).await;
         let requests = state.requests.read().expect("lock requests").clone();
 
         assert_eq!(

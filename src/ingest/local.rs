@@ -3,26 +3,11 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 use glob::Pattern;
-use rusqlite::{params, Connection, OptionalExtension};
-use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, VaultError};
-use crate::ingest::normalize::{normalize_markdown, unified_diff, NormalizedDocument};
-use crate::ingest::sections::{split_sections, SectionChunk};
-
-/// Summary metrics produced by syncing a single source.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub struct SyncSummary {
-    pub source_name: String,
-    pub pages_added: usize,
-    pub pages_updated: usize,
-    pub pages_unchanged: usize,
-    pub pages_stale: usize,
-    pub pages_failed: usize,
-    pub pruned: usize,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub warnings: Vec<String>,
-}
+use crate::ingest::normalize::normalize_markdown;
+use crate::ingest::persist::{MissingPagePolicy, PageIngestOutcome, SyncPages};
+use crate::ingest::sections::split_sections;
 
 #[derive(Debug, Clone)]
 enum CompiledPattern {
@@ -120,105 +105,24 @@ pub fn canonicalize_local_dir(origin: &Path) -> Result<PathBuf> {
     Ok(canonical)
 }
 
-/// Options controlling how [`persist_sync_outcomes`] reconciles unvisited pages.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum MissingPagePolicy {
-    /// Mark previously active/error pages not seen in this crawl as `'stale'`.
-    MarkStale,
-    /// Leave unvisited pages untouched (used when a web crawl hit `max_pages` without `--prune`).
-    Preserve,
-    /// Delete pages not seen in this crawl (`--prune`).
-    Prune,
-}
-
-/// Normalized page outcome produced by local or web ingestion before SQLite persistence.
-pub(crate) enum PageIngestOutcome {
-    Ready {
-        uri: String,
-        doc: NormalizedDocument,
-        chunks: Vec<SectionChunk>,
-        etag: Option<String>,
-        last_modified: Option<String>,
-        http_status: Option<i64>,
-    },
-    Failed {
-        uri: String,
-        http_status: Option<i64>,
-        error_message: String,
-        insert_if_missing: bool,
-    },
-    /// A URI this Sync visited that no longer holds a Page of its own. Its stored row is
-    /// retired (stale, or deleted with `--prune`) whatever the missing-page policy, since the
-    /// Sync did see it; no row is inserted for it.
-    Retired { uri: String },
-}
-
-/// Mark a source as `'syncing'` and insert a new `'running'` row into `sync_runs`.
-pub(crate) fn start_sync_run(conn: &Connection, source_id: i64) -> Result<i64> {
-    conn.execute(
-        "UPDATE sources SET status = 'syncing', last_error = NULL WHERE id = ?1",
-        [source_id],
-    )?;
-    conn.execute(
-        "INSERT INTO sync_runs (source_id, started_at, status)
-         VALUES (?1, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), 'running')",
-        [source_id],
-    )?;
-    Ok(conn.last_insert_rowid())
-}
-
-/// Record a failed sync run on both `sync_runs` and `sources`.
-pub(crate) fn fail_sync_run(conn: &Connection, source_id: i64, run_id: i64, message: &str) {
-    let _ = conn.execute(
-        "UPDATE sync_runs
-         SET finished_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
-             status = 'error',
-             error_message = ?2
-         WHERE id = ?1",
-        params![run_id, message],
-    );
-    let _ = conn.execute(
-        "UPDATE sources SET status = 'error', last_error = ?2 WHERE id = ?1",
-        params![source_id, message],
-    );
-}
-
-/// Synchronize a local Markdown directory into `pages`, `sections`, `page_revisions`, and `sync_runs`.
-pub fn sync_local_source(
-    conn: &mut Connection,
-    source_id: i64,
+/// The folder-walk driver: collect the Markdown pages of one local Source. It only reads
+/// the folder; the Source lifecycle writes the pages and records the Sync run.
+pub(crate) fn collect(
     source_name: &str,
     origin_dir: &Path,
     include_patterns: &[String],
     exclude_patterns: &[String],
     prune: bool,
-) -> Result<SyncSummary> {
+) -> Result<SyncPages> {
     let canon_root = canonicalize_local_dir(origin_dir)?;
     let matcher = PatternMatcher::new(include_patterns, exclude_patterns)?;
-    let run_id = start_sync_run(conn, source_id)?;
-
     let missing_policy = if prune {
         MissingPagePolicy::Prune
     } else {
         MissingPagePolicy::MarkStale
     };
-    match collect_local_outcomes(source_name, &canon_root, &matcher).and_then(|outcomes| {
-        persist_sync_outcomes(
-            conn,
-            source_id,
-            source_name,
-            run_id,
-            outcomes,
-            missing_policy,
-            Vec::new(),
-        )
-    }) {
-        Ok(summary) => Ok(summary),
-        Err(err) => {
-            fail_sync_run(conn, source_id, run_id, &err.to_string());
-            Err(err)
-        }
-    }
+    let outcomes = collect_local_outcomes(source_name, &canon_root, &matcher)?;
+    Ok(SyncPages::new(outcomes, missing_policy))
 }
 
 fn collect_local_outcomes(
@@ -280,381 +184,6 @@ fn collect_local_outcomes(
     }
 
     Ok(outcomes)
-}
-
-/// Persist all fetched/failed page outcomes, record diffs, reconcile stale pages, and finalize `sync_runs` + `sources`.
-pub(crate) fn persist_sync_outcomes(
-    conn: &mut Connection,
-    source_id: i64,
-    source_name: &str,
-    run_id: i64,
-    outcomes: Vec<PageIngestOutcome>,
-    missing_policy: MissingPagePolicy,
-    warnings: Vec<String>,
-) -> Result<SyncSummary> {
-    let mut summary = SyncSummary {
-        source_name: source_name.to_string(),
-        warnings,
-        ..Default::default()
-    };
-    let mut seen_uris: HashSet<String> = HashSet::with_capacity(outcomes.len());
-    let mut retired: Vec<String> = Vec::new();
-
-    let tx = conn.transaction()?;
-
-    for outcome in outcomes {
-        match outcome {
-            PageIngestOutcome::Retired { uri } => retired.push(uri),
-            PageIngestOutcome::Failed {
-                uri,
-                http_status,
-                error_message,
-                insert_if_missing,
-            } => {
-                seen_uris.insert(uri.clone());
-                summary.pages_failed += 1;
-                let existing_id: Option<i64> = tx
-                    .query_row(
-                        "SELECT id FROM pages WHERE source_id = ?1 AND uri = ?2",
-                        params![source_id, uri],
-                        |row| row.get(0),
-                    )
-                    .optional()?;
-
-                match existing_id {
-                    Some(page_id) => {
-                        tx.execute(
-                            "UPDATE pages
-                             SET status = 'error',
-                                 http_status = ?2,
-                                 error_message = ?3,
-                                 last_checked_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
-                             WHERE id = ?1",
-                            params![page_id, http_status, error_message],
-                        )?;
-                    }
-                    None if insert_if_missing => {
-                        tx.execute(
-                            "INSERT INTO pages (
-                                 source_id, uri, title, content_md, content_hash, word_count,
-                                 status, http_status, error_message
-                             ) VALUES (?1, ?2, '', '', '', 0, 'error', ?3, ?4)",
-                            params![source_id, uri, http_status, error_message],
-                        )?;
-                    }
-                    None => {}
-                }
-            }
-            PageIngestOutcome::Ready {
-                uri,
-                doc,
-                chunks,
-                etag,
-                last_modified,
-                http_status,
-            } => {
-                seen_uris.insert(uri.clone());
-                let existing: Option<(i64, String, String, String)> = tx
-                    .query_row(
-                        "SELECT id, content_hash, content_md, status
-                         FROM pages
-                         WHERE source_id = ?1 AND uri = ?2",
-                        params![source_id, uri],
-                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-                    )
-                    .optional()?;
-
-                match existing {
-                    None => {
-                        tx.execute(
-                            "INSERT INTO pages (
-                                 source_id, uri, title, content_md, content_hash, word_count,
-                                 etag, last_modified, status, http_status
-                             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'active', ?9)",
-                            params![
-                                source_id,
-                                uri,
-                                doc.title,
-                                doc.content_md,
-                                doc.content_hash,
-                                i64::try_from(doc.word_count).unwrap_or(i64::MAX),
-                                etag,
-                                last_modified,
-                                http_status,
-                            ],
-                        )?;
-                        let page_id = tx.last_insert_rowid();
-                        insert_sections(&tx, page_id, source_id, &chunks)?;
-                        summary.pages_added += 1;
-                    }
-                    Some((page_id, old_hash, old_content_md, old_status)) => {
-                        if old_hash.is_empty() {
-                            tx.execute(
-                                "UPDATE pages
-                                 SET title = ?2,
-                                     content_md = ?3,
-                                     content_hash = ?4,
-                                     word_count = ?5,
-                                     etag = ?6,
-                                     last_modified = ?7,
-                                     status = 'active',
-                                     http_status = ?8,
-                                     error_message = NULL,
-                                     last_checked_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
-                                     last_changed_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
-                                 WHERE id = ?1",
-                                params![
-                                    page_id,
-                                    doc.title,
-                                    doc.content_md,
-                                    doc.content_hash,
-                                    i64::try_from(doc.word_count).unwrap_or(i64::MAX),
-                                    etag,
-                                    last_modified,
-                                    http_status,
-                                ],
-                            )?;
-                            tx.execute("DELETE FROM sections WHERE page_id = ?1", [page_id])?;
-                            insert_sections(&tx, page_id, source_id, &chunks)?;
-                            summary.pages_added += 1;
-                        } else if old_hash == doc.content_hash {
-                            if old_status != "active"
-                                || http_status.is_some()
-                                || etag.is_some()
-                                || last_modified.is_some()
-                            {
-                                tx.execute(
-                                    "UPDATE pages
-                                     SET status = 'active',
-                                         error_message = NULL,
-                                         etag = COALESCE(?2, etag),
-                                         last_modified = COALESCE(?3, last_modified),
-                                         http_status = COALESCE(?4, http_status),
-                                         last_checked_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
-                                     WHERE id = ?1",
-                                    params![page_id, etag, last_modified, http_status],
-                                )?;
-                            } else {
-                                tx.execute(
-                                    "UPDATE pages
-                                     SET last_checked_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
-                                     WHERE id = ?1",
-                                    [page_id],
-                                )?;
-                            }
-                            summary.pages_unchanged += 1;
-                        } else {
-                            let diff = unified_diff(&old_content_md, &doc.content_md);
-                            tx.execute(
-                                "INSERT INTO page_revisions (page_id, previous_hash, new_hash, unified_diff, changed_at)
-                                 VALUES (?1, ?2, ?3, ?4, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
-                                 ON CONFLICT(page_id) DO UPDATE SET
-                                     previous_hash = excluded.previous_hash,
-                                     new_hash = excluded.new_hash,
-                                     unified_diff = excluded.unified_diff,
-                                     changed_at = excluded.changed_at",
-                                params![page_id, old_hash, doc.content_hash, diff],
-                            )?;
-                            tx.execute(
-                                "UPDATE pages
-                                 SET title = ?2,
-                                     content_md = ?3,
-                                     content_hash = ?4,
-                                     word_count = ?5,
-                                     etag = ?6,
-                                     last_modified = ?7,
-                                     status = 'active',
-                                     http_status = ?8,
-                                     error_message = NULL,
-                                     last_checked_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
-                                     last_changed_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
-                                 WHERE id = ?1",
-                                params![
-                                    page_id,
-                                    doc.title,
-                                    doc.content_md,
-                                    doc.content_hash,
-                                    i64::try_from(doc.word_count).unwrap_or(i64::MAX),
-                                    etag,
-                                    last_modified,
-                                    http_status,
-                                ],
-                            )?;
-                            tx.execute("DELETE FROM sections WHERE page_id = ?1", [page_id])?;
-                            insert_sections(&tx, page_id, source_id, &chunks)?;
-                            summary.pages_updated += 1;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    retire_visited_pages(
-        &tx,
-        source_id,
-        retired,
-        &mut seen_uris,
-        missing_policy == MissingPagePolicy::Prune,
-        &mut summary,
-    )?;
-
-    match missing_policy {
-        MissingPagePolicy::Preserve => {}
-        MissingPagePolicy::MarkStale => {
-            reconcile_missing_pages(&tx, source_id, &seen_uris, false, &mut summary)?;
-        }
-        MissingPagePolicy::Prune => {
-            reconcile_missing_pages(&tx, source_id, &seen_uris, true, &mut summary)?;
-        }
-    }
-
-    tx.execute(
-        "UPDATE sync_runs
-         SET finished_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
-             status = 'ok',
-             pages_added = ?2,
-             pages_updated = ?3,
-             pages_unchanged = ?4,
-             pages_stale = ?5,
-             pages_failed = ?6
-         WHERE id = ?1",
-        params![
-            run_id,
-            i64::try_from(summary.pages_added).unwrap_or(i64::MAX),
-            i64::try_from(summary.pages_updated).unwrap_or(i64::MAX),
-            i64::try_from(summary.pages_unchanged).unwrap_or(i64::MAX),
-            i64::try_from(summary.pages_stale).unwrap_or(i64::MAX),
-            i64::try_from(summary.pages_failed).unwrap_or(i64::MAX),
-        ],
-    )?;
-
-    tx.execute(
-        "UPDATE sources
-         SET status = 'ok',
-             last_synced_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
-             last_error = NULL
-         WHERE id = ?1",
-        [source_id],
-    )?;
-
-    tx.commit()?;
-    Ok(summary)
-}
-
-fn insert_sections(
-    tx: &rusqlite::Transaction<'_>,
-    page_id: i64,
-    source_id: i64,
-    chunks: &[crate::ingest::sections::SectionChunk],
-) -> Result<()> {
-    let mut stmt = tx.prepare_cached(
-        "INSERT INTO sections (page_id, source_id, ordinal, heading, heading_path, level, content_md, word_count)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-    )?;
-    for chunk in chunks {
-        stmt.execute(params![
-            page_id,
-            source_id,
-            i64::try_from(chunk.ordinal).unwrap_or(i64::MAX),
-            chunk.heading,
-            chunk.heading_path,
-            i64::from(chunk.level),
-            chunk.content_md,
-            i64::try_from(chunk.word_count).unwrap_or(i64::MAX),
-        ])?;
-    }
-    Ok(())
-}
-
-/// Retire the stored row of each `Retired` URI, and record it as seen so the missing-page pass
-/// does not count it again. A URI that also got its own result is left alone.
-fn retire_visited_pages(
-    tx: &rusqlite::Transaction<'_>,
-    source_id: i64,
-    retired: Vec<String>,
-    seen_uris: &mut HashSet<String>,
-    prune: bool,
-    summary: &mut SyncSummary,
-) -> Result<()> {
-    let mut lookup =
-        tx.prepare_cached("SELECT id, status FROM pages WHERE source_id = ?1 AND uri = ?2")?;
-    for uri in retired {
-        if !seen_uris.insert(uri.clone()) {
-            continue;
-        }
-        let existing: Option<(i64, String)> = lookup
-            .query_row(params![source_id, uri], |row| {
-                Ok((row.get(0)?, row.get(1)?))
-            })
-            .optional()?;
-        if let Some((page_id, status)) = existing {
-            retire_page(tx, page_id, &status, prune, summary)?;
-        }
-    }
-    Ok(())
-}
-
-/// Delete a page that is no longer at its Origin (`prune`), or mark an active or error page
-/// stale.
-fn retire_page(
-    tx: &rusqlite::Transaction<'_>,
-    page_id: i64,
-    status: &str,
-    prune: bool,
-    summary: &mut SyncSummary,
-) -> Result<()> {
-    if prune {
-        tx.execute("DELETE FROM pages WHERE id = ?1", [page_id])?;
-        summary.pruned += 1;
-    } else if status == "active" || status == "error" {
-        tx.execute(
-            "UPDATE pages
-             SET status = 'stale',
-                 last_checked_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
-             WHERE id = ?1",
-            [page_id],
-        )?;
-        summary.pages_stale += 1;
-    }
-    Ok(())
-}
-
-fn reconcile_missing_pages(
-    tx: &rusqlite::Transaction<'_>,
-    source_id: i64,
-    seen_uris: &HashSet<String>,
-    prune: bool,
-    summary: &mut SyncSummary,
-) -> Result<()> {
-    let missing: Vec<(i64, String)> = {
-        let mut stmt = tx.prepare(
-            "SELECT id, uri, status
-             FROM pages
-             WHERE source_id = ?1",
-        )?;
-        let rows = stmt.query_map([source_id], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-            ))
-        })?;
-        let mut collected = Vec::new();
-        for row in rows {
-            let (id, uri, status) = row?;
-            if !seen_uris.contains(&uri) {
-                collected.push((id, status));
-            }
-        }
-        collected
-    };
-
-    for (page_id, status) in missing {
-        retire_page(tx, page_id, &status, prune, summary)?;
-    }
-
-    Ok(())
 }
 
 fn collect_markdown_files(root: &Path, matcher: &PatternMatcher) -> Result<Vec<(String, PathBuf)>> {
@@ -758,21 +287,72 @@ fn relative_path_to_uri(rel: &Path) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+    //! The folder walk is tested through the Source lifecycle, the interface every entry
+    //! point uses: it walks the folder, writes the pages and records the Sync run.
+
     use super::*;
+    use crate::config::VaultConfig;
     use crate::db::open_rw_db;
+    use crate::ingest::SyncSummary;
+    use crate::sources::{AddSourceParams, SourceLifecycle};
+    use rusqlite::Connection;
     use tempfile::tempdir;
 
-    fn insert_test_source(conn: &Connection, name: &str, origin: &Path) -> i64 {
-        conn.execute(
-            "INSERT INTO sources (name, kind, origin) VALUES (?1, 'local', ?2)",
-            rusqlite::params![name, origin.to_string_lossy().as_ref()],
-        )
-        .expect("insert source should succeed");
-        conn.last_insert_rowid()
+    /// A vault with one local Source on `root`, registered but not synced.
+    struct LocalVault {
+        lifecycle: SourceLifecycle,
+        conn: Connection,
+        source_id: i64,
+        name: String,
     }
 
-    #[test]
-    fn ingests_nested_markdown_and_ignores_git_hidden_dirs() {
+    impl LocalVault {
+        async fn new(vault: &Path, root: &Path, name: &str) -> Self {
+            Self::with_patterns(vault, root, name, Vec::new(), Vec::new()).await
+        }
+
+        async fn with_patterns(
+            vault: &Path,
+            root: &Path,
+            name: &str,
+            include_patterns: Vec<String>,
+            exclude_patterns: Vec<String>,
+        ) -> Self {
+            let config = VaultConfig::new(vault);
+            let lifecycle = SourceLifecycle::new(config.clone());
+            let added = lifecycle
+                .add(
+                    AddSourceParams {
+                        origin: root.to_string_lossy().into_owned(),
+                        name: Some(name.to_string()),
+                        include_patterns,
+                        exclude_patterns,
+                        ..Default::default()
+                    },
+                    false,
+                )
+                .await
+                .expect("register local source");
+            Self {
+                lifecycle,
+                conn: open_rw_db(&config.db_path()).expect("open_rw_db"),
+                source_id: added.source.id,
+                name: name.to_string(),
+            }
+        }
+
+        async fn sync(&self, prune: bool) -> SyncSummary {
+            self.lifecycle
+                .sync(&self.name, prune)
+                .await
+                .expect("sync")
+                .synced()
+                .expect("claim is free")
+        }
+    }
+
+    #[tokio::test]
+    async fn ingests_nested_markdown_and_ignores_git_hidden_dirs() {
         let vault_dir = tempdir().expect("tempdir should succeed");
         let docs_dir = tempdir().expect("docs tempdir should succeed");
         let root = docs_dir.path();
@@ -811,12 +391,9 @@ mod tests {
         std::fs::write(root.join(".hidden-file.md"), "# Hidden File\n").expect("write hidden file");
         std::fs::write(root.join("notes.txt"), "Not a markdown file.\n").expect("write txt file");
 
-        let mut conn = open_rw_db(&vault_dir.path().join("vault.db")).expect("open_rw_db");
-        let canon = canonicalize_local_dir(root).expect("canonicalize_local_dir");
-        let source_id = insert_test_source(&conn, "book", &canon);
-
-        let summary = sync_local_source(&mut conn, source_id, "book", &canon, &[], &[], false)
-            .expect("sync_local_source should succeed");
+        let vault = LocalVault::new(vault_dir.path(), root, "book").await;
+        let (conn, source_id) = (&vault.conn, vault.source_id);
+        let summary = vault.sync(false).await;
 
         assert_eq!(summary.source_name, "book");
         assert_eq!(summary.pages_added, 3);
@@ -883,8 +460,8 @@ mod tests {
         assert_eq!(run_status, ("ok".to_string(), 3));
     }
 
-    #[test]
-    fn resync_skips_unchanged_and_records_diff_on_change() {
+    #[tokio::test]
+    async fn resync_skips_unchanged_and_records_diff_on_change() {
         let vault_dir = tempdir().expect("tempdir should succeed");
         let docs_dir = tempdir().expect("docs tempdir should succeed");
         let root = docs_dir.path();
@@ -896,12 +473,9 @@ mod tests {
         .expect("write alpha");
         std::fs::write(root.join("beta.md"), "# Beta\n\nStable beta body.\n").expect("write beta");
 
-        let mut conn = open_rw_db(&vault_dir.path().join("vault.db")).expect("open_rw_db");
-        let canon = canonicalize_local_dir(root).expect("canonicalize_local_dir");
-        let source_id = insert_test_source(&conn, "docs", &canon);
-
-        let first = sync_local_source(&mut conn, source_id, "docs", &canon, &[], &[], false)
-            .expect("initial sync");
+        let vault = LocalVault::new(vault_dir.path(), root, "docs").await;
+        let (conn, source_id) = (&vault.conn, vault.source_id);
+        let first = vault.sync(false).await;
         assert_eq!(first.pages_added, 2);
 
         // Substantive edit on alpha; beta stays untouched.
@@ -911,8 +485,7 @@ mod tests {
         )
         .expect("rewrite alpha");
 
-        let second = sync_local_source(&mut conn, source_id, "docs", &canon, &[], &[], false)
-            .expect("second sync");
+        let second = vault.sync(false).await;
 
         assert_eq!(second.pages_added, 0);
         assert_eq!(second.pages_updated, 1);
@@ -953,8 +526,8 @@ mod tests {
         assert_eq!(old_sec_hits, 0);
     }
 
-    #[test]
-    fn marks_deleted_file_stale_and_prunes_only_with_flag() {
+    #[tokio::test]
+    async fn marks_deleted_file_stale_and_prunes_only_with_flag() {
         let vault_dir = tempdir().expect("tempdir should succeed");
         let docs_dir = tempdir().expect("docs tempdir should succeed");
         let root = docs_dir.path();
@@ -962,18 +535,13 @@ mod tests {
         std::fs::write(root.join("keep.md"), "# Keep\n\nStays around.\n").expect("write keep");
         std::fs::write(root.join("drop.md"), "# Drop\n\nWill be deleted.\n").expect("write drop");
 
-        let mut conn = open_rw_db(&vault_dir.path().join("vault.db")).expect("open_rw_db");
-        let canon = canonicalize_local_dir(root).expect("canonicalize_local_dir");
-        let source_id = insert_test_source(&conn, "docs", &canon);
-
-        sync_local_source(&mut conn, source_id, "docs", &canon, &[], &[], false)
-            .expect("initial sync");
+        let vault = LocalVault::new(vault_dir.path(), root, "docs").await;
+        let (conn, source_id) = (&vault.conn, vault.source_id);
+        vault.sync(false).await;
 
         std::fs::remove_file(root.join("drop.md")).expect("remove drop.md");
 
-        let default_resync =
-            sync_local_source(&mut conn, source_id, "docs", &canon, &[], &[], false)
-                .expect("default resync");
+        let default_resync = vault.sync(false).await;
         assert_eq!(default_resync.pages_unchanged, 1);
         assert_eq!(default_resync.pages_stale, 1);
         assert_eq!(default_resync.pruned, 0);
@@ -987,8 +555,7 @@ mod tests {
             .expect("query drop.md status");
         assert_eq!(drop_status, "stale");
 
-        let prune_resync = sync_local_source(&mut conn, source_id, "docs", &canon, &[], &[], true)
-            .expect("prune resync");
+        let prune_resync = vault.sync(true).await;
         assert_eq!(prune_resync.pages_unchanged, 1);
         assert_eq!(prune_resync.pages_stale, 0);
         assert_eq!(prune_resync.pruned, 1);
@@ -1022,14 +589,13 @@ mod tests {
         let expected = std::fs::canonicalize(dir.path().join("real-docs")).expect("canonicalize");
         assert_eq!(canon, expected);
 
-        let mut conn = open_rw_db(&dir.path().join("vault.db")).expect("open_rw_db");
-        let sync_err = sync_local_source(&mut conn, 1, "bad", &file_path, &[], &[], false)
-            .expect_err("sync_local_source must reject non-directory");
-        assert!(matches!(sync_err, VaultError::Validation(_)));
+        let walk_err = collect("bad", &file_path, &[], &[], false)
+            .expect_err("the folder walk must reject a non-directory");
+        assert!(matches!(walk_err, VaultError::Validation(_)));
     }
 
-    #[test]
-    fn filters_files_with_include_and_exclude_patterns() {
+    #[tokio::test]
+    async fn filters_files_with_include_and_exclude_patterns() {
         let vault_dir = tempdir().expect("tempdir should succeed");
         let docs_dir = tempdir().expect("docs tempdir should succeed");
         let root = docs_dir.path();
@@ -1040,20 +606,16 @@ mod tests {
         std::fs::write(root.join("docs/drafts/wip.md"), "# WIP\n").expect("write wip");
         std::fs::write(root.join("blog/post.md"), "# Post\n").expect("write post");
 
-        let mut conn = open_rw_db(&vault_dir.path().join("vault.db")).expect("open_rw_db");
-        let canon = canonicalize_local_dir(root).expect("canonicalize");
-        let source_id = insert_test_source(&conn, "filtered", &canon);
-
-        let summary = sync_local_source(
-            &mut conn,
-            source_id,
+        let vault = LocalVault::with_patterns(
+            vault_dir.path(),
+            root,
             "filtered",
-            &canon,
-            &["docs/*".to_string()],
-            &["docs/drafts".to_string()],
-            false,
+            vec!["docs/*".to_string()],
+            vec!["docs/drafts".to_string()],
         )
-        .expect("sync with patterns");
+        .await;
+        let (conn, source_id) = (&vault.conn, vault.source_id);
+        let summary = vault.sync(false).await;
 
         assert_eq!(summary.pages_added, 1);
         let uri: String = conn

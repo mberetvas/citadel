@@ -5,14 +5,26 @@
 //! it never waits on its caller, so dropping the handle neither cancels the Sync nor leaks
 //! the claim.
 
+use std::time::Instant;
+
+use rusqlite::Connection;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 use super::claim::ClaimGuard;
+use super::sync_run::SyncRun;
 use super::{blocking, SourceLifecycle, Stage, SyncOutcome};
 use crate::db::open_rw_db;
 use crate::error::{Result, VaultError};
+use crate::ingest::persist::{write_pages, SyncPages};
 use crate::ingest::{load_source_by_id, load_source_by_name, SourceRecord, SyncSummary};
+
+/// A Sync that holds its claim and has opened its Sync run.
+struct Begun {
+    source: SourceRecord,
+    guard: ClaimGuard,
+    run: SyncRun,
+}
 
 /// Which Source a Sync is for.
 pub(super) enum Target {
@@ -96,8 +108,10 @@ async fn run(
         let lifecycle = lifecycle.clone();
         blocking(move || begin(&lifecycle, target)).await
     };
-    // A caller that went away no longer wants the report; the Sync goes on regardless.
-    let (source, guard) = match begun {
+    // A caller that went away no longer wants the report; the Sync goes on regardless. When
+    // the Sync does not start, the report is the whole answer: the handle never reads the
+    // task's own error below.
+    let Begun { source, guard, run } = match begun {
         Ok(Some(begun)) => {
             let _ = report.send(Ok(true));
             begun
@@ -115,25 +129,59 @@ async fn run(
         }
     };
 
-    let result = lifecycle.sync_record(&source, prune).await;
-    let config = lifecycle.config.clone();
-    let released = blocking(move || {
-        let conn = open_rw_db(&config.db_path())?;
-        guard.release(&conn)
-    })
-    .await;
-    if let Err(err) = released {
+    // If the driver panics, unwinding drops the guard: it releases the claim, and the
+    // release closes the open run as interrupted.
+    let collected = lifecycle.driver.collect(source.clone(), prune).await;
+    blocking(move || finish(&lifecycle, &source, run, guard, collected)).await
+}
+
+/// Write the pages and close the run (or record the failure), then release the claim.
+fn finish(
+    lifecycle: &SourceLifecycle,
+    source: &SourceRecord,
+    run: SyncRun,
+    guard: ClaimGuard,
+    collected: Result<SyncPages>,
+) -> Result<SyncSummary> {
+    let mut conn = open_rw_db(&lifecycle.config.db_path())?;
+    let result = collected.and_then(|pages| write(lifecycle, &mut conn, source, run, pages));
+    if let Err(err) = &result {
+        if let Err(record_err) = run.fail(&conn, &err.to_string()) {
+            tracing::warn!(source = %source.name, error = %record_err, "failed to record sync failure");
+        }
+    }
+    if let Err(err) = guard.release(&conn) {
         tracing::warn!(source = %source.name, error = %err, "failed to release sync claim");
     }
     result
 }
 
-/// Load the Source and take its claim, in one blocking hop. The guard is built here, next
-/// to the row it guards, so no await separates them.
-fn begin(
+/// Write the pages and close the run as `'ok'` in one transaction, then tell the driver.
+fn write(
     lifecycle: &SourceLifecycle,
-    target: Target,
-) -> Result<Option<(SourceRecord, ClaimGuard)>> {
+    conn: &mut Connection,
+    source: &SourceRecord,
+    run: SyncRun,
+    mut pages: SyncPages,
+) -> Result<SyncSummary> {
+    let on_written = pages.on_written.take();
+    lifecycle.probe.at(Stage::Writing);
+    let started = Instant::now();
+    let written = conn.transaction().map_err(VaultError::from).and_then(|tx| {
+        let summary = write_pages(&tx, source.id, &source.name, pages)?;
+        run.succeed(&tx, &summary)?;
+        tx.commit()?;
+        Ok(summary)
+    });
+    if let Some(on_written) = on_written {
+        on_written(written.is_ok(), started.elapsed());
+    }
+    written
+}
+
+/// Load the Source, take its claim and open its Sync run, in one blocking hop. The guard is
+/// built here, next to the row it guards, so no await separates them.
+fn begin(lifecycle: &SourceLifecycle, target: Target) -> Result<Option<Begun>> {
     let db_path = lifecycle.config.db_path();
     match target {
         Target::Name(name) => {
@@ -159,18 +207,16 @@ fn begin(
     }
 }
 
-fn begin_on(
-    lifecycle: &SourceLifecycle,
-    conn: &rusqlite::Connection,
-    id: i64,
-) -> Result<Option<(SourceRecord, ClaimGuard)>> {
+fn begin_on(lifecycle: &SourceLifecycle, conn: &Connection, id: i64) -> Result<Option<Begun>> {
     lifecycle.probe.at(Stage::Loaded);
     let Some(guard) = ClaimGuard::acquire(conn, lifecycle.config.db_path(), id, &lifecycle.claims)?
     else {
         return Ok(None);
     };
     lifecycle.probe.at(Stage::Claimed);
-    // Reload so the Sync uses the Source's current settings.
+    // Reload so the Sync uses the Source's current settings. On an error the guard drops
+    // here and releases the claim.
     let source = load_source_by_id(conn, id)?;
-    Ok(Some((source, guard)))
+    let run = SyncRun::open(conn, id)?;
+    Ok(Some(Begun { source, guard, run }))
 }
