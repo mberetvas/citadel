@@ -544,7 +544,7 @@ Running `citadel setup` in an interactive TTY launches a guided `cliclack` wizar
 | `POST /api/sources` | Add a web URL or local Markdown folder |
 | `DELETE /api/sources/:id` | Delete a source |
 | `POST /api/sources/:id/sync` | Trigger async background sync for a source |
-| `GET /api/pages` | List Pages of every Source, or of one with `?source=<id or name>`; `?status=` takes a comma-separated subset of `active,stale,error`; `?q=` searches. No row cap. Each item carries `source_name`, `http_status` and `error_message` |
+| `GET /api/pages` | List Pages of every Source, or of one with `?source=<id or name>`; `?status=` takes a comma-separated subset of `active,stale,error`; `?q=` searches; `?limit=` caps the list (1–10000, default 1000) and the response header `X-Citadel-Truncated: true` marks a list cut at its limit. Each item carries `source_name`, `http_status` and `error_message` |
 | `GET /api/sources/:id/pages` | Same list for the Source in the path (same filters and response) |
 | `GET /api/pages/:id` | Full page Markdown + sections + metadata |
 | `GET /api/pages/:id/diff` | Latest unified diff from `page_revisions` |
@@ -552,14 +552,16 @@ Running `citadel setup` in an interactive TTY launches a guided `cliclack` wizar
 | `GET /api/version` | Current version and cached update availability (`update-check.json`) |
 
 Page lists come from `ingest::read` (`src/ingest/read.rs`), which the CLI (`list`, `show`) and the daemon scheduler and watcher use too:
-- **Search:** each word of `q` matches as an FTS5 phrase in the title and Markdown content (porter-stemmed; a trailing `*` makes a prefix), or the whole term matches as a URI substring. Matches rank by `bm25`, then URI; otherwise Pages are ordered by URI. The term is quoted, so FTS5 syntax in it is matched as words, never parsed; any SQLite error is returned, never replaced by another search.
+- **Search:** each word of `q` matches as an FTS5 phrase in the title and Markdown content (porter-stemmed; a trailing `*` makes a prefix), or the whole term matches as a URI substring. The FTS5 MATCH runs once per search (a `MATERIALIZED` CTE), not once per Page. Matches rank by `bm25`, then URI; otherwise Pages are ordered by URI. The term is quoted, so FTS5 syntax in it is matched as words, never parsed; any SQLite error is returned, never replaced by another search.
 - **Error page:** a Page whose `pages.status` is `error`. The counts, the `status` filter and the Browser's error banner all use this rule.
 - **Missing vault:** a read never creates the vault. A missing vault reads as empty: lists are empty and lookups are `404`/NotFound. (MCP `query` still creates the vault on first use.)
+- **Bounded:** every read stops after 5 s with `QueryTimeout` (408 in the UI), the same progress-handler deadline as MCP `query`.
+- **Out-of-range stored limits:** a `max_pages`/`max_depth` outside `u32` (only a hand edit can store one) is logged at `warn` and read as the default (500 / 5), so one bad Source row does not break Source lists, the scheduler, the watcher or a delete.
 - **Blocking:** every UI read runs in `spawn_blocking`, so a slow query does not hold an async worker that `serve` shares with `/mcp` and the scheduler. Reads open the vault read-only and skip the schema batch.
 
 ### UI Views (Lightweight Vanilla JS / Minimal CSS)
 1. **Sources:** Table of web + local sources, status badges, last-synced time, quick Add modal, Sync/Delete actions (with a subtle header badge when `GET /api/version` reports an update available).
-2. **Knowledge Browser:** Filter by source (or All sources), status or search through `GET /api/pages`, inspect rendered/raw Markdown and heading sections.
+2. **Knowledge Browser:** Filter by source (or All sources), status or search through `GET /api/pages` (a count of `1000+` means the list was cut; a superseded search's response is dropped), inspect rendered/raw Markdown and heading sections.
 3. **Changes & Health:** Recent diffs (`v_recent_changes`) with colored unified diff viewer + list of `stale`/`error` pages (`GET /api/pages?status=stale,error`, newest check first).
 4. **SQL Explorer:** Interactive read-only query box using the exact same `query` engine as the MCP server.
 
