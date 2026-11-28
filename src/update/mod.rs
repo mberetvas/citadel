@@ -468,7 +468,8 @@ fn report_restart<W: Write>(out: &mut W, restart: Restart) -> Result<()> {
                 out,
                 "Warning: the daemon has not stopped yet{reason}, so it was not restarted and \
                  still runs the old version. A daemon finishing a Sync exits once the Sync is \
-                 done: when `citadel daemon status` reports it stopped, run \
+                 done; its OS service, if it has one, may then relaunch it on the new \
+                 version. When `citadel daemon status` reports it stopped, run \
                  `citadel daemon start`."
             )?;
         }
