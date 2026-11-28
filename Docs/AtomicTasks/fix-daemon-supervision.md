@@ -1,0 +1,195 @@
+# Daemon supervision: one owner
+
+Source: architecture review 2026-11-28, candidate 01 (Strong). Region: `src/daemon/service.rs`,
+the pid/process code of `src/daemon/mod.rs`, `src/doctor/`, `src/update/mod.rs`, the daemon arm
+of `src/cli/mod.rs`.
+
+## Findings
+
+### 1. `daemon_version_check` rows that get `kickstart -k`: confirmed, all four
+`restart_hint(service_installed)` (`src/doctor/version.rs:108-117`) is used by every warn row
+of `daemon_version_check` (`version.rs:121-150`):
+- "daemon runs X, cli is Y";
+- "binary no longer exists";
+- "binary replaced since the daemon started";
+- "daemon started by an older citadel (version unknown)".
+
+All four mean the binary on disk changed under the running daemon. That is exactly when launchd
+can refuse to spawn the job (`EX_CONFIG`, "needs LWCR update") while `kickstart -k` exits 0. That
+lesson is in AGENTS.md and at `src/daemon/service.rs:248-250`.
+
+Red test: `doctor::version::tests::restart_hint_never_kickstarts_a_swapped_binary` fails on
+macOS with `daemon runs 0.2.0, cli is 0.3.0: launchctl kickstart -k gui/$(id -u)/com.citadel.daemon`.
+
+On Linux the hint is `systemctl --user restart citadel.service`, which does run the new binary. The
+wrong hint is macOS-only.
+
+### 2. Doctor's loaded-only rule names another vault's job: confirmed
+`src/doctor/mod.rs:69-74` treats any `Installed { loaded: true, .. }` as the service that runs
+this daemon, whatever its `CITADEL_HOME`. `update` already requires the data dir to match
+(`service_supervises`, `src/update/mod.rs:474-483`). So the two "supervised" rules disagree.
+
+For a vault whose daemon was spawned detached while the one launchd job serves another vault,
+doctor's hint therefore restarts the other vault's daemon.
+
+Red test: the rule was extracted unchanged into `service_runs_daemon`. Then
+`doctor::tests::another_vaults_service_does_not_run_this_daemon` fails: a loaded job for
+`/vaults/other` counts as running `/vaults/this`.
+
+### 3. launchctl/systemctl call sites and dialects: changed
+| Call site | Command | Dialect |
+|---|---|---|
+| `service.rs:128` install | `launchctl unload <plist>` (status ignored) | legacy |
+| `service.rs:133` install | `launchctl load -w <plist>` | legacy |
+| `service.rs:155` uninstall | `launchctl unload <plist>` | legacy |
+| `service.rs:257` start | `launchctl bootout gui/<uid>/com.citadel.daemon` | modern |
+| `service.rs:263` start | `launchctl bootstrap gui/<uid> <plist>`, retried for 10 s | modern |
+| `doctor/running.rs:173` loaded? | `launchctl list com.citadel.daemon` | legacy |
+| `doctor/version.rs:113` hint | `launchctl kickstart -k gui/$(id -u)/…` (printed, not run) | modern |
+| `service.rs:185,194` install | `systemctl --user daemon-reload`, `enable --now citadel.service` | — |
+| `service.rs:213,217` uninstall | `systemctl --user disable --now`, `daemon-reload` | — |
+| `service.rs:269` start | `systemctl --user start citadel.service` | — |
+| `doctor/running.rs:184` loaded? | `systemctl --user is-active citadel.service` | — |
+| `doctor/version.rs:115` hint | `systemctl --user restart citadel.service` (printed) | — |
+| `update/mod.rs:988` test | the string "launchctl kickstart failed" | — |
+| `Docs/SPEC.md:504,575-576`, `Docs/resource-usage.md:36`, README:246-253 | prose | — |
+
+Does install's legacy `unload`/`load -w` hit the teardown race that `start_service` retries
+around? **Refuted.** It has a different defect instead.
+
+Evidence: a throwaway LaunchAgent (label `dev.citadel-investigation.teardown`, never the citadel
+job) ran a `/bin/sh` loop that takes 3, 6 or 12 s to exit on SIGTERM. Observed on this Mac
+(Darwin 27.2), one run each, not documented launchd behaviour:
+- `launchctl unload` blocked about 5 s (5.02 s and 5.16 s), and the process was gone afterwards.
+  With a 12 s handler it was gone too, so unload ends the job after about 5 s. The `load -w`
+  that followed succeeded every time. So legacy `unload` does not race.
+- `launchctl bootout` returned in 0.05 s with the job still listed. An immediate `bootstrap`
+  failed: `Bootstrap failed: 5: Input/output error`, exit 5. This is the race `start_service`
+  retries around.
+- `launchctl load -w` right after a `bootout` printed `Load failed: 5: Input/output error` but
+  **exited 0**. Install's `status.success()` check (`service.rs:139`) can therefore never see a
+  failed load. `citadel daemon install` can then print "Installed background service" with
+  nothing loaded.
+
+Linux has a related gap. `service_is_loaded` uses `systemctl --user is-active`, which means
+"running now", not "registered". After a clean stop, `Restart=on-failure` does not relaunch the
+unit, so an enabled, stopped unit reads as "not loaded". Update's `service_supervises` then says
+unsupervised. Also, `install` runs `enable --now`, which does not restart a running unit, so
+`citadel daemon install` after a binary swap leaves the old binary running. That contradicts
+update's advice "run `citadel daemon install`, which restarts it … on the new version".
+
+### 4a. CLI `daemon start` takes the unsupervised spawn path beside a service: confirmed
+Confirmed by reading the code. `src/cli/mod.rs:497` calls `daemon::start_daemon(config, false)`,
+which goes to `start_daemon_with_exe` (`src/daemon/mod.rs:187-213`). That function checks only
+the pid lock and then spawns a detached `citadel daemon start --foreground`. It never consults
+the OS service.
+
+So the PR #22 symptom happens without `update`: the launchd job (after launchd refused a swapped
+binary) or the stopped systemd unit stays registered, and an unsupervised daemon runs beside it.
+The manager keeps failing on the lock. A red test needs a service seam, which does not exist yet,
+so this one is proven through the new interface (see Acceptance criteria).
+
+### 4b. `stop_daemon` reports a timeout when KeepAlive relaunches immediately: confirmed
+`stop_daemon` (`src/daemon/mod.rs:217-247`) polls until the lock is not held by *any* pid. launchd
+relaunches a `KeepAlive` job at once when it has run longer than its throttle interval, which is
+the normal case for a daemon. The relaunched daemon holds the lock under a new pid. The poll
+mistakes it for the old one and reports "did not exit within 5 seconds" after the old daemon
+has exited.
+
+Even when stop is reported correctly, a SIGTERM to a supervised daemon stops nothing: the manager
+starts it again.
+
+Red test: `daemon::tests::stop_reports_a_daemon_relaunched_by_its_service_manager_as_stopped`. A
+real `sleep` child stands in for the old daemon, and the lock is re-recorded under another pid
+once the child exits. The test fails with `sent SIGTERM to daemon (pid …), but it did not exit
+within 5 seconds`.
+
+## Task
+Give daemon supervision one owner: a new module `src/daemon/supervision.rs`.
+- It answers whether this vault's launchd job or systemd unit runs the daemon.
+- It starts, stops and restarts the daemon in a way that survives a binary swap.
+- It words the restart hint.
+
+Doctor, update and the CLI's `daemon start`/`stop` call it. Install, uninstall, start and stop
+use one launchctl dialect (`bootout`/`enable`/`bootstrap`).
+
+## Acceptance criteria
+- `update` no longer imports `doctor::running`. `ServiceState` and the service-file parsing
+  live in the supervision module, and doctor only renders them.
+- Doctor's daemon-version hint never names `launchctl`/`systemctl`. It is
+  `citadel daemon stop && citadel daemon start`, which is right in every case because both
+  commands route through the module (claims 1 and 2).
+- A daemon is supervised when this vault's service file exists and names this vault's data dir,
+  whether or not the manager has it loaded or active right now. Another vault's job never
+  counts (claim 2).
+- `citadel daemon start` with this vault's service installed starts the service (launchd: reload
+  with retry; systemd: `start`). It never spawns a detached daemon (claim 4a).
+- `citadel daemon stop` with this vault's service installed stops the service first (launchd
+  `bootout`, systemd `stop`), so `KeepAlive` does not undo it. It then sends SIGTERM to whatever
+  still holds the lock.
+- A stop that sees the lock re-taken by another pid reports that the old daemon stopped and that
+  it was relaunched, without a timeout (claim 4b).
+- `citadel daemon install` reloads through the same routine as start, so a failed bootstrap is
+  an error (claim 3). On Linux it restarts the unit so a swapped binary takes effect.
+- `citadel update` restarts through the module (stop, then start). Its decision-table tests drive
+  the module through a fake service manager that models:
+  - `KeepAlive` relaunch;
+  - launchd refusing to spawn the job after a binary swap;
+  - a daemon still finishing a Sync.
+
+  The closure-driven tests are deleted.
+- Both production adapters (launchd, systemd) compile on every platform. Only the default
+  adapter is chosen by `cfg(target_os)`.
+- SPEC.md's doctor, update and daemon sections describe the new behaviour. CONTEXT.md gains
+  **Supervised daemon**.
+- Gate: `cargo fmt --check`, both clippy runs, and `cargo test` all pass.
+
+## Design decisions
+**Interface.** A `Supervision` value is built for one vault, with its dependencies passed in:
+- `service()` returns the `ServiceState`, which doctor renders.
+- `supervised()` says whether this vault's service runs the daemon.
+- `status()`.
+- `start()` returns `Started::{Service, Spawned}(pid)`.
+- `stop()` returns `Stopped::{NotRunning, Stopped(pid), Relaunched { pid, by }}`.
+- `restart(old_pid)` returns a `Restart` outcome that update turns into text.
+- `RESTART_HINT`.
+
+All of the decision logic lives behind those few calls: which path to take, the lock polling,
+relaunch detection, and the binary-swap-safe reload.
+
+**Seams.** There are two small ports, each with production adapters and one shared fake:
+- `ServiceManager` (`inspect`, `start`, `stop`). Its production adapters are `Launchd` and
+  `Systemd`; `cfg(target_os)` picks the default, and on other platforms there is none.
+- `DaemonProcess` (`terminate(pid)`, `spawn()`). Its production adapter sends SIGTERM and spawns
+  a detached child.
+
+The process port exists because KeepAlive relaunch happens when the *process* exits. A fake
+that only owned the service could not model it. Tests that went through real SIGTERM would also
+signal the test runner, because `PidLock` records the test's own pid. The fake holds real flock
+locks in a tempdir vault under fake pids, so `daemon_status` stays the production pid-file code.
+
+**Supervised = this vault's service is installed, not "loaded".** `is-active` is false for a
+stopped unit, and a job that `daemon stop` booted out is not loaded. A "loaded" rule would send
+the next `start` down the detached path, which is the bug in claim 4a. Doctor's "installed and
+loaded" row keeps its meaning, but systemd's check becomes `is-enabled`, so it matches launchd's
+"registered" semantics.
+
+Because `stop` now boots out the job, a not-loaded launchd job for this vault is normal. That
+row's hint becomes `citadel daemon start`, which loads it.
+
+**`stop` stops the service.** This is a visible change. Under KeepAlive, today's
+`citadel daemon stop` cannot stop a supervised daemon, so it was wrong. The job comes back at the
+next login (launchd loads the plist again) or with `citadel daemon start`, the same as an
+enabled systemd unit.
+
+**Rejected alternatives.**
+- **Keep a platform-specific doctor hint** (a `launchctl bootout && bootstrap` one-liner). It is
+  long, platform-forked and easy to get wrong. The citadel commands are right everywhere once
+  they route through the module.
+- **`citadel daemon install` as the hint.** It rewrites the plist to the current executable, so
+  running doctor from a dev build would point the service at that build.
+- **Keep closures for update's restart.** The review flagged canned closures as the reason the
+  restart path regressed three times. A fake that models launchd lets the tests state the
+  launchd facts.
+- **Only compare against the old pid in `stop` (no service stop).** That fixes the false
+  timeout, but the daemon still comes straight back.
