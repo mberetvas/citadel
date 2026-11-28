@@ -15,8 +15,8 @@ use crate::config::VaultConfig;
 use crate::db::open_rw_db;
 use crate::error::{Result, VaultError};
 use crate::ingest::{
-    load_all_sources, load_source_by_id, load_source_by_name, local, SourceKind, SourceRecord,
-    SyncSummary, DEFAULT_MAX_DEPTH, DEFAULT_MAX_PAGES,
+    load_all_sources, load_source_by_id, load_source_by_name, local, web, SourceKind,
+    SourceRecord, SyncSummary, DEFAULT_MAX_DEPTH, DEFAULT_MAX_PAGES,
 };
 
 mod claim;
@@ -335,6 +335,23 @@ pub struct RemovedSource {
     pub pages_deleted: usize,
 }
 
+/// Check include/exclude patterns with the parser the Source's Syncs use: a web Source's
+/// patterns become its crawl and store filters (`WebScope`), a local Source's are globs.
+fn validate_patterns(
+    kind: SourceKind,
+    origin: &str,
+    include_patterns: &[String],
+    exclude_patterns: &[String],
+) -> Result<()> {
+    match kind {
+        SourceKind::Web => web::validate_scope_patterns(origin, include_patterns, exclude_patterns),
+        SourceKind::Local => {
+            local::validate_patterns(include_patterns)?;
+            local::validate_patterns(exclude_patterns)
+        }
+    }
+}
+
 fn register_source_row(config: &VaultConfig, params: AddSourceParams) -> Result<SourceRecord> {
     let (kind, normalized_origin) = classify_origin(&params.origin)?;
     if kind == SourceKind::Web {
@@ -347,8 +364,12 @@ fn register_source_row(config: &VaultConfig, params: AddSourceParams) -> Result<
     let max_depth = params.max_depth.unwrap_or(DEFAULT_MAX_DEPTH);
 
     validate_source_limits(refresh_interval_secs, max_pages, max_depth)?;
-    local::validate_patterns(&params.include_patterns)?;
-    local::validate_patterns(&params.exclude_patterns)?;
+    validate_patterns(
+        kind,
+        &normalized_origin,
+        &params.include_patterns,
+        &params.exclude_patterns,
+    )?;
 
     let tags = normalize_string_list(params.tags);
     let includes = normalize_string_list(params.include_patterns);
@@ -567,20 +588,20 @@ fn update_source(
         .tags
         .map(normalize_string_list)
         .unwrap_or(existing.tags);
-    let includes = match params.include_patterns {
-        Some(list) => {
-            local::validate_patterns(&list)?;
-            normalize_string_list(list)
-        }
-        None => existing.include_patterns,
-    };
-    let excludes = match params.exclude_patterns {
-        Some(list) => {
-            local::validate_patterns(&list)?;
-            normalize_string_list(list)
-        }
-        None => existing.exclude_patterns,
-    };
+    validate_patterns(
+        existing.kind,
+        &existing.origin,
+        params.include_patterns.as_deref().unwrap_or_default(),
+        params.exclude_patterns.as_deref().unwrap_or_default(),
+    )?;
+    let includes = params
+        .include_patterns
+        .map(normalize_string_list)
+        .unwrap_or(existing.include_patterns);
+    let excludes = params
+        .exclude_patterns
+        .map(normalize_string_list)
+        .unwrap_or(existing.exclude_patterns);
 
     let refresh_interval_secs = params
         .refresh_interval_secs

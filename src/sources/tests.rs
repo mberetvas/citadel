@@ -169,6 +169,35 @@ async fn update_and_remove_roundtrip() {
 }
 
 #[tokio::test]
+async fn web_source_patterns_are_validated_on_add_and_update() {
+    let vault_dir = tempdir().expect("vault tempdir");
+    let lifecycle = SourceLifecycle::new(VaultConfig::new(vault_dir.path()));
+    let web = |include: &str| AddSourceParams {
+        origin: "https://example.com/docs".into(),
+        include_patterns: vec![include.into()],
+        ..Default::default()
+    };
+
+    let err = lifecycle.add(web("api/**x"), false).await.unwrap_err();
+    assert!(matches!(err, VaultError::Validation(_)), "{err}");
+
+    lifecycle
+        .add(web("api/[!d]*"), false)
+        .await
+        .expect("valid web patterns");
+    let err = lifecycle
+        .update(
+            "example-com-docs",
+            UpdateSourceParams {
+                exclude_patterns: Some(vec!["api/[".into()]),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(err, VaultError::Validation(_)), "{err}");
+}
+
+#[tokio::test]
 async fn operations_on_missing_vault_do_not_create_it() {
     let vault_dir = tempdir().expect("vault tempdir");
     let config = VaultConfig::new(vault_dir.path().join("absent"));
