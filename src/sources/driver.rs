@@ -74,6 +74,7 @@ mod fake {
     enum Step {
         Pages,
         Fail(String),
+        NotFound(String),
         Panic,
         Given(Mutex<Option<SyncPages>>),
     }
@@ -127,6 +128,11 @@ mod fake {
             Self::with(Step::Fail(message.to_string()))
         }
 
+        /// The walk or crawl fails with `NotFound` (e.g. a missing remote page tree).
+        pub(crate) fn not_found(message: &str) -> Self {
+            Self::with(Step::NotFound(message.to_string()))
+        }
+
         /// The walk or crawl panics.
         pub(crate) fn panicking() -> Self {
             Self::with(Step::Panic)
@@ -161,6 +167,7 @@ mod fake {
                 }
                 let mut pages = match &*this.step {
                     Step::Fail(message) => return Err(VaultError::Other(message.clone())),
+                    Step::NotFound(message) => return Err(VaultError::NotFound(message.clone())),
                     Step::Panic => panic!("driver panicked mid-crawl"),
                     Step::Given(pages) => pages
                         .lock()

@@ -251,12 +251,16 @@ impl SourceLifecycle {
         let mut results = Vec::with_capacity(sources.len());
         for source in sources {
             let name = source.name.clone();
-            let result = match self.start_sync_record(source, prune).finish().await {
+            // Only a Source removed before its Sync took the claim is skipped; any error
+            // from the Sync itself is reported.
+            let result = match self.start_sync_record(source, prune).claimed().await {
                 Err(VaultError::NotFound(_)) => {
                     tracing::info!(source = %name, "skipped: removed during sync_all");
                     continue;
                 }
-                result => result,
+                Err(err) => Err(err),
+                Ok(None) => Ok(SyncOutcome::AlreadySyncing),
+                Ok(Some(running)) => running.finish().await.map(SyncOutcome::Synced),
             };
             results.push(SourceSyncResult { name, result });
         }

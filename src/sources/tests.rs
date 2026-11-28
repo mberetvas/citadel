@@ -1079,3 +1079,23 @@ async fn database_open_failure_before_the_write_reports_it_and_closes_the_run() 
     assert_failure_recorded(&config, "docs");
     assert_eq!(sync_runs(&config, "docs").len(), 1);
 }
+
+#[tokio::test]
+async fn sync_all_reports_a_drivers_not_found_instead_of_skipping_the_source() {
+    let (_vault, _config, lifecycle) = vault_with_docs().await;
+    let results = lifecycle
+        .with_driver(FakeDriver::not_found("remote tree is gone"))
+        .sync_all(false)
+        .await
+        .expect("sync_all");
+    assert_eq!(
+        results.len(),
+        1,
+        "only a Source removed before its claim is skipped"
+    );
+    assert!(
+        matches!(&results[0].result, Err(VaultError::NotFound(_))),
+        "{:?}",
+        results[0].result
+    );
+}
