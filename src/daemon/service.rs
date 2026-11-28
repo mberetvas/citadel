@@ -278,62 +278,84 @@ fn systemd_unit_path() -> Result<PathBuf> {
         .join(SYSTEMD_SERVICE_NAME))
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+impl Launchd {
+    fn install(bin_path: &Path, data_dir: &Path) -> Result<PathBuf> {
+        let plist = launchd_plist_path()?;
+        if let Some(parent) = plist.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&plist, generate_launchd_plist(bin_path, data_dir))?;
+        Launchd {
+            plist: plist.clone(),
+        }
+        .reload()?;
+        Ok(plist)
+    }
+
+    fn uninstall() -> Result<Option<PathBuf>> {
+        let plist = launchd_plist_path()?;
+        if !plist.exists() {
+            return Ok(None);
+        }
+        let _ = Launchd {
+            plist: plist.clone(),
+        }
+        .stop();
+        std::fs::remove_file(&plist)?;
+        Ok(Some(plist))
+    }
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+impl Systemd {
+    fn install(bin_path: &Path, data_dir: &Path) -> Result<PathBuf> {
+        let unit_path = systemd_unit_path()?;
+        if let Some(parent) = unit_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&unit_path, generate_systemd_unit(bin_path, data_dir))?;
+        run_service_command("systemctl", &["--user", "daemon-reload"])?;
+        run_service_command("systemctl", &systemd_args("enable"))?;
+        // `restart` starts a stopped unit and replaces a running one, so a changed unit or
+        // binary takes effect (`enable --now` leaves a running unit alone).
+        run_service_command("systemctl", &systemd_args("restart"))?;
+        Ok(unit_path)
+    }
+
+    fn uninstall() -> Result<Option<PathBuf>> {
+        let unit_path = systemd_unit_path()?;
+        if !unit_path.exists() {
+            return Ok(None);
+        }
+        let _ = run_service_command(
+            "systemctl",
+            &["--user", "disable", "--now", SYSTEMD_SERVICE_NAME],
+        );
+        std::fs::remove_file(&unit_path)?;
+        let _ = run_service_command("systemctl", &["--user", "daemon-reload"]);
+        Ok(Some(unit_path))
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn install_service_for_platform(bin_path: &Path, data_dir: &Path) -> Result<PathBuf> {
-    let plist = launchd_plist_path()?;
-    if let Some(parent) = plist.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(&plist, generate_launchd_plist(bin_path, data_dir))?;
-    Launchd {
-        plist: plist.clone(),
-    }
-    .reload()?;
-    Ok(plist)
+    Launchd::install(bin_path, data_dir)
 }
 
 #[cfg(target_os = "macos")]
 fn uninstall_service_for_platform() -> Result<Option<PathBuf>> {
-    let plist = launchd_plist_path()?;
-    if !plist.exists() {
-        return Ok(None);
-    }
-    let _ = Launchd {
-        plist: plist.clone(),
-    }
-    .stop();
-    std::fs::remove_file(&plist)?;
-    Ok(Some(plist))
+    Launchd::uninstall()
 }
 
 #[cfg(target_os = "linux")]
 fn install_service_for_platform(bin_path: &Path, data_dir: &Path) -> Result<PathBuf> {
-    let unit_path = systemd_unit_path()?;
-    if let Some(parent) = unit_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(&unit_path, generate_systemd_unit(bin_path, data_dir))?;
-    run_service_command("systemctl", &["--user", "daemon-reload"])?;
-    run_service_command("systemctl", &systemd_args("enable"))?;
-    // `restart` starts a stopped unit and replaces a running one, so a changed unit or binary
-    // takes effect (`enable --now` leaves a running unit alone).
-    run_service_command("systemctl", &systemd_args("restart"))?;
-    Ok(unit_path)
+    Systemd::install(bin_path, data_dir)
 }
 
 #[cfg(target_os = "linux")]
 fn uninstall_service_for_platform() -> Result<Option<PathBuf>> {
-    let unit_path = systemd_unit_path()?;
-    if !unit_path.exists() {
-        return Ok(None);
-    }
-    let _ = run_service_command(
-        "systemctl",
-        &["--user", "disable", "--now", SYSTEMD_SERVICE_NAME],
-    );
-    std::fs::remove_file(&unit_path)?;
-    let _ = run_service_command("systemctl", &["--user", "daemon-reload"]);
-    Ok(Some(unit_path))
+    Systemd::uninstall()
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]

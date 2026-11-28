@@ -193,3 +193,38 @@ enabled systemd unit.
   launchd facts.
 - **Only compare against the old pid in `stop` (no service stop).** That fixes the false
   timeout, but the daemon still comes straight back.
+
+## Outcome (HumanAudit)
+
+### Red → green
+| Claim | Red on the old code | Green now |
+|---|---|---|
+| 1 | `doctor::version::tests::restart_hint_never_kickstarts_a_swapped_binary`: hint was `launchctl kickstart -k …` | Same test; every warn row's hint is `RESTART_HINT` (`citadel daemon stop && citadel daemon start`). |
+| 2 | `doctor::tests::another_vaults_service_does_not_run_this_daemon`, on the rule extracted unchanged (`service_runs_daemon`) | Test and rule deleted: doctor no longer needs a "supervised" rule, because its hint is constant. Coverage of the one remaining rule: `daemon::supervision::tests::only_this_vaults_service_supervises_its_daemon`. |
+| 4a | None: there was no seam, so the evidence is from code reading. | `daemon::supervision::tests::start_runs_a_supervised_daemon_through_its_service`; this test was written before the module existed, through the fake. |
+| 4b | `daemon::tests::stop_reports_a_daemon_relaunched_by_its_service_manager_as_stopped` (real `sleep` child): "did not exit within 5 seconds" | Moved to `daemon::supervision::tests::` (same name, real `OsProcess`). It now expects `Stopped::Relaunched { pid, by }` and no timeout. It also caught a real race: `PidLock` truncates, then writes the pid, so a poll can read pid 0. Stop and start now wait for a non-zero pid. Also covered by `stop_keeps_a_supervised_daemon_stopped` (fake). |
+| 3 | No unit test, because launchctl is only run live (throwaway label above). | `daemon::service::tests::launchd_start_reloads_the_existing_plist`: install now goes through the same `bootout`/`enable`/`bootstrap` reload. |
+
+`launchctl enable` was checked on the throwaway label `dev.citadel-investigation.enable`:
+- It exits 0 when the label is unknown, when it is loaded, and when it is disabled.
+- `bootstrap` of a disabled job fails with `5: Input/output error` until `enable` runs.
+
+So `enable` stays on the reload path and its error is propagated.
+
+### Behaviour changes
+- **`citadel daemon stop` with this vault's service** stops the service first: launchd `bootout`, systemd `stop`. It then sends SIGTERM to whatever holds the lock. The launchd job stays unloaded until `citadel daemon start` or the next login.
+  - If stopping the service fails (for example, systemd with no user bus), the failure is logged and the daemon is still signalled.
+  - A relaunch is then reported, not a timeout.
+- **"Supervised"** no longer requires the job to be loaded. So `daemon start` and `update` load a job the user unloaded by hand. They also clear a `launchctl disable` (`enable` before `bootstrap`); before this change only `install` did that, through `load -w`.
+- **An update restart that finds the daemon still finishing a Sync** (`Restart::NotStopped`) leaves a supervised job booted out. The message tells the user to run `citadel daemon start`, which reloads it.
+- **Doctor:**
+  - The daemon-version hint is always `citadel daemon stop && citadel daemon start`.
+  - A service file that is present but not loaded is `·` info with hint `citadel daemon start`. It used to be a warn with hint `citadel daemon install`.
+  - systemd "loaded" means `is-enabled`, not `is-active`.
+- **`citadel daemon start` through the service** prints "Started citadel daemon through its OS service (pid …, log: …)."
+- **`citadel daemon install` on Linux** runs `enable` and then `restart`, instead of `enable --now`.
+
+### Verification limits
+- Supervised paths were exercised through the fake adapter only. No live launchd or systemd run was made against the citadel job, as the brief forbids.
+- The CLI smoke test used a temp `HOME`/`CITADEL_HOME` with no service: start, status, a second start (refused), stop, a second stop, and `doctor`.
+- The Linux adapters and install code now compile on macOS too: only the choice of adapter is behind `cfg`. Linux behaviour itself was not run.

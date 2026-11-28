@@ -228,7 +228,11 @@ impl Supervision {
         // Read before the service stop, which may already end the daemon.
         let before = daemon_status(&self.config)?;
         if supervised {
-            self.manager.stop()?;
+            // Still signal the daemon: without a service stop it may be relaunched, which the
+            // poll below reports.
+            if let Err(err) = self.manager.stop() {
+                tracing::warn!(error = %err, "could not stop the daemon's OS service");
+            }
         }
         let pid = match before {
             DaemonStatus::Stopped => return Ok(Stopped::NotRunning),
@@ -359,6 +363,8 @@ mod tests {
         finishing_sync: bool,
         /// The job cannot be loaded (`bootstrap` keeps failing).
         job_broken: bool,
+        /// Stopping the service fails (systemd: no user bus).
+        stop_fails: bool,
         spawns: u32,
         service_starts: u32,
     }
@@ -453,6 +459,9 @@ mod tests {
 
         fn stop(&self) -> Result<()> {
             let mut w = self.0.borrow_mut();
+            if w.stop_fails {
+                return Err(VaultError::Other("Failed to connect to bus".into()));
+            }
             let Some(service) = w.service.as_mut() else {
                 return Err(VaultError::Other("no service installed".into()));
             };
@@ -504,6 +513,7 @@ mod tests {
                 next_pid: 100,
                 finishing_sync: false,
                 job_broken: false,
+                stop_fails: false,
                 spawns: 0,
                 service_starts: 0,
             })));
@@ -662,6 +672,16 @@ mod tests {
         let stopped = rig.supervision().stop().expect("stop");
         let by = rig.running().expect("relaunched");
         assert_ne!(by, pid);
+        assert_eq!(stopped, Stopped::Relaunched { pid, by });
+    }
+
+    #[test]
+    fn stop_still_signals_the_daemon_when_the_service_stop_fails() {
+        let rig = Rig::new().with_this_vaults_service();
+        let pid = rig.running().expect("running");
+        rig.world().stop_fails = true;
+        let stopped = rig.supervision().stop().expect("stop");
+        let by = rig.running().expect("the loaded service relaunched it");
         assert_eq!(stopped, Stopped::Relaunched { pid, by });
     }
 
