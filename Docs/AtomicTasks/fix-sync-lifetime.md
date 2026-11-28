@@ -71,9 +71,11 @@ Make the Source lifecycle run each Sync as one task, from claim to release:
 3. The UI keeps 202/409: the claim is known before the reply, and a second request gets 409 while a Sync runs.
 4. One Sync opens exactly one Sync run and closes it exactly once, by id. No `MAX(id)` guess, no `record_sync_failure`.
 5. The 'ok' close and `sources.status='ok'` commit in the same transaction as the page writes.
-6. Every failure stage records one error run, sets `status='error'` and `last_error`, and releases the claim. The stages are:
-   - Source missing (nothing recorded);
-   - opening the run;
+6. Every failure after the Sync run is open records one error run, sets `status='error'` and `last_error`, and releases the claim. A failure before that records nothing and releases any claim it took:
+   - Source missing: `NotFound`, no run, no claim;
+   - opening the run fails: no run, status unchanged, claim released (`failure_to_open_the_run_releases_the_claim`).
+
+   Failures after the run is open:
    - the driver fails;
    - the driver panics;
    - writing pages fails.
