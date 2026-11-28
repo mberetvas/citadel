@@ -16,7 +16,7 @@ use super::sync_run::SyncRun;
 use super::{blocking, SourceLifecycle, Stage, SyncOutcome};
 use crate::db::open_rw_db;
 use crate::error::{Result, VaultError};
-use crate::ingest::persist::{write_pages, SyncPages};
+use crate::ingest::persist::{write_pages, OnWritten, SyncPages};
 use crate::ingest::{load_source_by_id, load_source_by_name, SourceRecord, SyncSummary};
 
 /// A Sync that holds its claim and has opened its Sync run.
@@ -135,7 +135,9 @@ async fn run(
     blocking(move || finish(&lifecycle, &source, run, guard, collected)).await
 }
 
-/// Write the pages and close the run (or record the failure), then release the claim.
+/// Write the pages and close the run (or record the failure), then release the claim. The
+/// driver's own error, when it has one, is the Sync's error; the driver always hears how the
+/// write went, even when it never started.
 fn finish(
     lifecycle: &SourceLifecycle,
     source: &SourceRecord,
@@ -143,15 +145,56 @@ fn finish(
     guard: ClaimGuard,
     collected: Result<SyncPages>,
 ) -> Result<SyncSummary> {
-    let mut conn = open_rw_db(&lifecycle.config.db_path())?;
-    let result = collected.and_then(|pages| write(lifecycle, &mut conn, source, run, pages));
-    if let Err(err) = &result {
-        if let Err(record_err) = run.fail(&conn, &err.to_string()) {
-            tracing::warn!(source = %source.name, error = %record_err, "failed to record sync failure");
+    let (pages, report) = match collected {
+        Ok(mut pages) => {
+            let report = WriteReport::new(pages.on_written.take());
+            (Ok(pages), report)
         }
-    }
-    if let Err(err) = guard.release(&conn) {
-        tracing::warn!(source = %source.name, error = %err, "failed to release sync claim");
+        Err(err) => (Err(err), WriteReport::new(None)),
+    };
+    let db_path = lifecycle.config.db_path();
+    lifecycle.probe.at(Stage::Finishing);
+    let (result, conn) = match open_rw_db(&db_path) {
+        Ok(mut conn) => {
+            let result =
+                pages.and_then(|pages| write(lifecycle, &mut conn, source, run, pages, report));
+            (result, Some(conn))
+        }
+        Err(open_err) => {
+            report.done(false);
+            let err = match pages {
+                Err(driver_err) => driver_err,
+                Ok(_) => open_err,
+            };
+            // Try once more, on a fresh connection, to record the failure and release.
+            lifecycle.probe.at(Stage::Recording);
+            let conn = open_rw_db(&db_path)
+                .map_err(|retry_err| {
+                    tracing::warn!(source = %source.name, error = %retry_err, "failed to reopen the vault to record a failed sync");
+                })
+                .ok();
+            (Err(err), conn)
+        }
+    };
+    match conn {
+        Some(conn) => {
+            if let Err(err) = &result {
+                if let Err(record_err) = run.fail(&conn, &err.to_string()) {
+                    tracing::warn!(source = %source.name, error = %record_err, "failed to record sync failure");
+                }
+            }
+            if let Err(err) = guard.release(&conn) {
+                tracing::warn!(source = %source.name, error = %err, "failed to release sync claim");
+            }
+        }
+        None => {
+            // Nothing could be recorded: log the Sync's error; the dropped guard retries the
+            // release (and closes the run as interrupted) in the background.
+            if let Err(err) = &result {
+                tracing::warn!(source = %source.name, error = %err, "sync failed and could not be recorded");
+            }
+            drop(guard);
+        }
     }
     result
 }
@@ -162,21 +205,55 @@ fn write(
     conn: &mut Connection,
     source: &SourceRecord,
     run: SyncRun,
-    mut pages: SyncPages,
+    pages: SyncPages,
+    report: WriteReport,
 ) -> Result<SyncSummary> {
-    let on_written = pages.on_written.take();
     lifecycle.probe.at(Stage::Writing);
-    let started = Instant::now();
+    let report = report.started();
     let written = conn.transaction().map_err(VaultError::from).and_then(|tx| {
         let summary = write_pages(&tx, source.id, &source.name, pages)?;
         run.succeed(&tx, &summary)?;
         tx.commit()?;
         Ok(summary)
     });
-    if let Some(on_written) = on_written {
-        on_written(written.is_ok(), started.elapsed());
-    }
+    report.done(written.is_ok());
     written
+}
+
+/// Delivers a driver's `on_written` report exactly once. Dropped unreported (a panic while
+/// writing), it reports a failed write.
+struct WriteReport {
+    on_written: Option<OnWritten>,
+    started: Instant,
+}
+
+impl WriteReport {
+    fn new(on_written: Option<OnWritten>) -> Self {
+        Self {
+            on_written,
+            started: Instant::now(),
+        }
+    }
+
+    /// Time the write from now.
+    fn started(mut self) -> Self {
+        self.started = Instant::now();
+        self
+    }
+
+    fn done(mut self, ok: bool) {
+        if let Some(on_written) = self.on_written.take() {
+            on_written(ok, self.started.elapsed());
+        }
+    }
+}
+
+impl Drop for WriteReport {
+    fn drop(&mut self) {
+        if let Some(on_written) = self.on_written.take() {
+            on_written(false, self.started.elapsed());
+        }
+    }
 }
 
 /// Load the Source, take its claim and open its Sync run, in one blocking hop. The guard is
@@ -214,9 +291,17 @@ fn begin_on(lifecycle: &SourceLifecycle, conn: &Connection, id: i64) -> Result<O
         return Ok(None);
     };
     lifecycle.probe.at(Stage::Claimed);
-    // Reload so the Sync uses the Source's current settings. On an error the guard drops
-    // here and releases the claim.
-    let source = load_source_by_id(conn, id)?;
-    let run = SyncRun::open(conn, id)?;
-    Ok(Some(Begun { source, guard, run }))
+    // Reload so the Sync uses the Source's current settings, then open the run. On an error
+    // the claim is released here, before the caller hears of it.
+    let opened = load_source_by_id(conn, id)
+        .and_then(|source| SyncRun::open(conn, id).map(|run| (source, run)));
+    match opened {
+        Ok((source, run)) => Ok(Some(Begun { source, guard, run })),
+        Err(err) => {
+            if let Err(release_err) = guard.release(conn) {
+                tracing::warn!(source_id = id, error = %release_err, "failed to release sync claim");
+            }
+            Err(err)
+        }
+    }
 }

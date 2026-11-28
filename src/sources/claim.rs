@@ -33,6 +33,9 @@ pub(crate) struct ClaimEnv {
     pub(crate) now: Arc<dyn Fn() -> i64 + Send + Sync>,
     /// Whether a process with this pid is running on this host.
     pub(crate) pid_alive: Arc<dyn Fn(i64) -> bool + Send + Sync>,
+    /// Called with the Source id when a dropped [`ClaimGuard`] has to release its claim in
+    /// the background instead of on the path that ended the claim. Tests count these.
+    pub(crate) on_late_release: Arc<dyn Fn(i64) + Send + Sync>,
 }
 
 impl std::fmt::Debug for ClaimEnv {
@@ -52,6 +55,7 @@ impl ClaimEnv {
             token: instance_token().to_string(),
             now: Arc::new(unix_now),
             pid_alive: Arc::new(pid_is_running),
+            on_late_release: Arc::new(|_| {}),
         }
     }
 }
@@ -202,12 +206,16 @@ impl Drop for ClaimGuard {
             return;
         }
         let (db_path, env, id) = (self.db_path.clone(), self.env.clone(), self.source_id);
+        (env.on_late_release)(id);
         let release = move || {
             let result = open_rw_db(&db_path).and_then(|conn| release(&conn, id, &env));
             if let Err(err) = result {
                 tracing::warn!(source_id = id, error = %err, "failed to release sync claim");
             }
         };
+        // A blocking task queued while the runtime shuts down may never run. The claim row
+        // is then left behind like a crashed process's: the next Sync takes it over once
+        // this pid is gone, or on a pid reused with another instance token (ADR-0001).
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
                 handle.spawn_blocking(release);

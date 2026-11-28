@@ -57,6 +57,11 @@ pub(crate) enum Stage {
     Claimed,
     /// The driver collected the pages; they are about to be written.
     Writing,
+    /// The driver returned; the final hop is about to open the database.
+    Finishing,
+    /// Opening the database in the final hop failed; it is about to retry once to record
+    /// the failure and release the claim.
+    Recording,
 }
 
 /// Test seam: called synchronously at each [`Stage`]. Always empty in production.
@@ -187,11 +192,20 @@ impl SourceLifecycle {
         let config = self.config.clone();
         let name = name.to_string();
         // The guard moves into the hop, so the claim is held until the removal ends.
-        blocking(move || {
-            let removed = remove_source(&config, &name)?;
-            // Deleting the Source cascaded its claim row away.
-            guard.forget();
-            Ok(Removal::Removed(removed))
+        blocking(move || match remove_source(&config, &name) {
+            Ok(removed) => {
+                // Deleting the Source cascaded its claim row away.
+                guard.forget();
+                Ok(Removal::Removed(removed))
+            }
+            Err(err) => {
+                // Release before returning, so an immediate retry is not refused.
+                let released = open_rw_db(&config.db_path()).and_then(|conn| guard.release(&conn));
+                if let Err(release_err) = released {
+                    tracing::warn!(source = %name, error = %release_err, "failed to release sync claim");
+                }
+                Err(err)
+            }
         })
         .await
     }

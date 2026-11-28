@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::sync::atomic::Ordering;
 
 use axum::response::Html;
 use axum::routing::get;
@@ -868,9 +869,16 @@ async fn failure_to_open_the_run_releases_the_claim() {
     .expect("install trigger");
     let lifecycle = lifecycle.with_driver(FakeDriver::one_page());
 
+    let (lifecycle, late) = counting_late_releases(lifecycle);
+
     let err = lifecycle.sync("docs", false).await.expect_err("open fails");
     assert!(err.to_string().contains("runs table is locked"), "{err}");
-    wait_for_no_claims(&config).await;
+    assert_eq!(
+        late.load(Ordering::SeqCst),
+        0,
+        "released before the error returned"
+    );
+    assert_eq!(claim_rows(&config), 0, "an immediate retry is not refused");
     assert!(sync_runs(&config, "docs").is_empty());
     assert_eq!(status_of(&config, "docs"), "idle", "nothing was started");
 
@@ -956,4 +964,118 @@ async fn sync_caller_dropped_during_driver_or_write_still_finishes() {
             "at_write={at_write}"
         );
     }
+}
+
+/// The lifecycle, and a count of claims its dropped guards had to release in the
+/// background, after the call that ended the claim had already returned.
+fn counting_late_releases(
+    mut lifecycle: SourceLifecycle,
+) -> (
+    SourceLifecycle,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) {
+    let late = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = std::sync::Arc::clone(&late);
+    lifecycle.claims.on_late_release = std::sync::Arc::new(move |_| {
+        counter.fetch_add(1, Ordering::SeqCst);
+    });
+    (lifecycle, late)
+}
+
+#[tokio::test]
+async fn failed_remove_releases_the_claim_before_returning() {
+    let (_vault, config, lifecycle) = vault_with_docs().await;
+    crate::db::open_rw_db(&config.db_path())
+        .expect("open db")
+        .execute_batch(
+            "CREATE TRIGGER keep_sources BEFORE DELETE ON sources
+             BEGIN SELECT RAISE(ABORT, 'sources are read-only'); END;",
+        )
+        .expect("install trigger");
+    let (lifecycle, late) = counting_late_releases(lifecycle.with_driver(FakeDriver::one_page()));
+
+    let err = lifecycle.remove("docs").await.expect_err("remove fails");
+    assert!(err.to_string().contains("sources are read-only"), "{err}");
+    assert_eq!(
+        late.load(Ordering::SeqCst),
+        0,
+        "released before the error returned"
+    );
+    assert_eq!(claim_rows(&config), 0);
+    assert!(
+        matches!(
+            lifecycle.sync("docs", false).await.expect("sync"),
+            SyncOutcome::Synced(_)
+        ),
+        "an immediate retry is not refused (UI: 409)"
+    );
+}
+
+/// Make the final hop's first database open fail (as a locked or exhausted database does),
+/// and let the retry that records the failure succeed.
+fn failing_first_finish_open(lifecycle: SourceLifecycle, config: &VaultConfig) -> SourceLifecycle {
+    use std::os::unix::fs::PermissionsExt;
+    let db = config.db_path();
+    lifecycle.with_probe(move |stage| {
+        let mode = match stage {
+            Stage::Finishing => 0o000,
+            Stage::Recording => 0o644,
+            _ => return,
+        };
+        std::fs::set_permissions(&db, std::fs::Permissions::from_mode(mode))
+            .expect("chmod vault.db");
+    })
+}
+
+fn restore_db_permissions(config: &VaultConfig) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(config.db_path(), std::fs::Permissions::from_mode(0o644))
+        .expect("restore vault.db");
+}
+
+#[tokio::test]
+async fn database_open_failure_after_the_driver_keeps_its_error_and_closes_the_run() {
+    let (_vault, config, lifecycle) = vault_with_docs().await;
+    let (lifecycle, late) = counting_late_releases(lifecycle);
+    let lifecycle = failing_first_finish_open(
+        lifecycle.with_driver(FakeDriver::failing("crawl broke")),
+        &config,
+    );
+
+    let err = lifecycle.sync("docs", false).await.expect_err("sync fails");
+    restore_db_permissions(&config);
+    assert!(
+        err.to_string().contains("crawl broke"),
+        "the driver's error wins: {err}"
+    );
+    assert_eq!(
+        late.load(Ordering::SeqCst),
+        0,
+        "released before the error returned"
+    );
+    assert_failure_recorded(&config, "docs");
+    assert_eq!(
+        sync_runs(&config, "docs"),
+        [("error".to_string(), Some("crawl broke".to_string()), true)]
+    );
+}
+
+#[tokio::test]
+async fn database_open_failure_before_the_write_reports_it_and_closes_the_run() {
+    let (_vault, config, lifecycle) = vault_with_docs().await;
+    let fake = FakeDriver::one_page();
+    let (lifecycle, late) = counting_late_releases(lifecycle);
+    let lifecycle = failing_first_finish_open(lifecycle.with_driver(fake.clone()), &config);
+
+    let err = lifecycle.sync("docs", false).await.expect_err("sync fails");
+    restore_db_permissions(&config);
+    assert!(err.to_string().contains("unable to open"), "{err}");
+    assert_eq!(fake.written(), [false], "the driver hears the write failed");
+    assert_eq!(
+        late.load(Ordering::SeqCst),
+        0,
+        "released before the error returned"
+    );
+    assert_failure_recorded(&config, "docs");
+    assert_eq!(sync_runs(&config, "docs").len(), 1);
 }

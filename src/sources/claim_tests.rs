@@ -17,6 +17,7 @@ fn env(pid: i64, token: &str, clock: &Arc<AtomicI64>, alive: bool) -> ClaimEnv {
         token: token.to_string(),
         now: Arc::new(move || clock.load(Ordering::SeqCst)),
         pid_alive: Arc::new(move |_| alive),
+        on_late_release: Arc::new(|_| {}),
     }
 }
 
