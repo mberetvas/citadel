@@ -453,7 +453,7 @@ citadel
   ui [--port <port>] [--no-open]  # launch embedded local Web UI (native)
   daemon
     start [--foreground]          # through this vault's OS service when installed, else detached
-    stop                          # stops this vault's OS service first, so it stays stopped
+    stop                          # drains the daemon, then stops this vault's OS service
     status
     install                       # write & (re)load launchd (macOS) / systemd --user (Linux)
     uninstall

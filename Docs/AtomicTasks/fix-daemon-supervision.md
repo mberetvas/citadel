@@ -126,7 +126,7 @@ use one launchctl dialect (`bootout`/`enable`/`bootstrap`).
   with retry; systemd: `start`). It never spawns a detached daemon (claim 4a).
 - `citadel daemon stop` with this vault's service installed stops the service first (launchd
   `bootout`, systemd `stop`), so `KeepAlive` does not undo it. It then sends SIGTERM to whatever
-  still holds the lock.
+  still holds the lock. *(Superseded by Review fixes, finding 1: the daemon is drained first; the service is stopped only after it exits.)*
 - A stop that sees the lock re-taken by another pid reports that the old daemon stopped and that
   it was relaunched, without a timeout (claim 4b).
 - `citadel daemon install` reloads through the same routine as start, so a failed bootstrap is
@@ -171,13 +171,13 @@ locks in a tempdir vault under fake pids, so `daemon_status` stays the productio
 **Supervised = this vault's service is installed, not "loaded".** `is-active` is false for a
 stopped unit, and a job that `daemon stop` booted out is not loaded. A "loaded" rule would send
 the next `start` down the detached path, which is the bug in claim 4a. Doctor's "installed and
-loaded" row keeps its meaning, but systemd's check becomes `is-enabled`, so it matches launchd's
+loaded" row keeps its meaning, but systemd's check becomes `is-enabled` *(reverted to `is-active`, Review fixes finding 5)*, so it matches launchd's
 "registered" semantics.
 
 Because `stop` now boots out the job, a not-loaded launchd job for this vault is normal. That
 row's hint becomes `citadel daemon start`, which loads it.
 
-**`stop` stops the service.** This is a visible change. Under KeepAlive, today's
+**`stop` stops the service.** *(Superseded by Review fixes, finding 1: the daemon is drained first; the service is stopped only after it exits.)* This is a visible change. Under KeepAlive, today's
 `citadel daemon stop` cannot stop a supervised daemon, so it was wrong. The job comes back at the
 next login (launchd loads the plist again) or with `citadel daemon start`, the same as an
 enabled systemd unit.
@@ -212,7 +212,7 @@ enabled systemd unit.
 So `enable` stays on the reload path and its error is propagated.
 
 ### Behaviour changes
-- **`citadel daemon stop` with this vault's service** stops the service first: launchd `bootout`, systemd `stop`. It then sends SIGTERM to whatever holds the lock. The launchd job stays unloaded until `citadel daemon start` or the next login.
+- **`citadel daemon stop` with this vault's service** stops the service first: launchd `bootout`, systemd `stop`. It then sends SIGTERM to whatever holds the lock. The launchd job stays unloaded until `citadel daemon start` or the next login. *(Superseded by Review fixes, finding 1: the daemon is drained first; the service is stopped only after it exits.)*
   - If stopping the service fails (for example, systemd with no user bus), the failure is logged and the daemon is still signalled.
   - A relaunch is then reported, not a timeout.
 - **"Supervised"** no longer requires the job to be loaded. So `daemon start` and `update` load a job the user unloaded by hand. They also clear a `launchctl disable` (`enable` before `bootstrap`); before this change only `install` did that, through `load -w`.
@@ -281,11 +281,21 @@ it on the new version.
     default) before SIGKILL, so a Sync shorter than that finishes.
   - A fix would drain through `Supervision::stop` before reloading. It is out of this
     review's scope.
+- **`citadel daemon uninstall` while a Sync runs.** `Launchd::uninstall` boots the job out
+  with no drain, and `systemctl disable --now` stops the unit, so either can SIGKILL a daemon
+  mid-Sync. On `main`, `unload` did the same. The fix is the same as for install: drain
+  through `Supervision::stop` first.
 - **Version bump at merge** (finding 6).
 
 ### Remaining risks
 - Supervised paths are tested through the fake only. No live launchd or systemd run touched
   the citadel job.
+- **A relaunched daemon is not always idle.** The scheduler's `tokio::time::interval` fires
+  its first tick at startup. A daemon that KeepAlive relaunched during the drain can therefore
+  queue a due web Sync, which starts after a 0–30 s jitter. Most of the time the service stop
+  ends it within the 5 s window, before the jitter runs out. If the jitter is short, the
+  relaunched daemon may already be syncing, and the service stop can then cut that fresh Sync
+  off (`ExitTimeOut`). The local-folder watcher does not index on startup.
 - The drain-first stop relies on KeepAlive leaving a gap in which the service stop ends the
   relaunched daemon. The service stop and `wait_until_free` cover it, but a real launchd job
   was not exercised.
