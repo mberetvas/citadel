@@ -512,7 +512,7 @@ fn dispatch_command<W: Write>(
                 Ok(())
             }
             DaemonCommands::Stop => {
-                use crate::daemon::supervision::{Stopped, Supervision, Wait};
+                use crate::daemon::supervision::{Supervision, Wait};
                 let supervision = Supervision::for_vault(&config, std::env::current_exe()?);
                 let interrupted = ctrl_c_flag();
                 let mut last_line: Option<std::time::Instant> = None;
@@ -532,19 +532,7 @@ fn dispatch_command<W: Write>(
                     }
                     Wait::Continue
                 })?;
-                match stopped {
-                    Stopped::Stopped(pid) => writeln!(out, "Stopped citadel daemon (pid {pid}).")?,
-                    Stopped::Relaunched { pid, by } => writeln!(
-                        out,
-                        "Stopped citadel daemon (pid {pid}), but another daemon took over at \
-                         once (pid {by}), most likely relaunched by a service manager."
-                    )?,
-                    Stopped::NotRunning => writeln!(out, "Daemon is not running.")?,
-                    Stopped::StillDraining { pid, supervised } => {
-                        writeln!(out, "{}", still_draining_message(pid, supervised))?
-                    }
-                }
-                Ok(())
+                report_stopped(out, stopped)
             }
             DaemonCommands::Status => {
                 match crate::daemon::daemon_status(&config)? {
@@ -1061,6 +1049,43 @@ fn waiting_line(sources: &[String], draining: &crate::daemon::supervision::Drain
     )
 }
 
+/// A failure the command has already explained on its output: the process exits 1 and
+/// prints nothing more.
+#[derive(Debug)]
+pub struct SilentExit;
+
+impl std::fmt::Display for SilentExit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("command did not finish (explained above)")
+    }
+}
+
+impl std::error::Error for SilentExit {}
+
+/// Print the outcome of `citadel daemon stop`.
+fn report_stopped<W: Write>(
+    out: &mut W,
+    stopped: crate::daemon::supervision::Stopped,
+) -> anyhow::Result<()> {
+    use crate::daemon::supervision::Stopped;
+    match stopped {
+        Stopped::Stopped(pid) => writeln!(out, "Stopped citadel daemon (pid {pid}).")?,
+        Stopped::Relaunched { pid, by } => writeln!(
+            out,
+            "Stopped citadel daemon (pid {pid}), but another daemon took over at once \
+             (pid {by}), most likely relaunched by a service manager."
+        )?,
+        Stopped::NotRunning => writeln!(out, "Daemon is not running.")?,
+        Stopped::StillDraining { pid, supervised } => {
+            writeln!(out, "{}", still_draining_message(pid, supervised))?;
+            // Not stopped: fail, so `citadel daemon stop && citadel daemon start` does not run a
+            // start the still-running daemon would refuse. The message above says it all.
+            return Err(SilentExit.into());
+        }
+    }
+    Ok(())
+}
+
 /// What a `citadel daemon stop` left behind when the user stopped waiting.
 fn still_draining_message(pid: u32, supervised: bool) -> String {
     let after = if supervised {
@@ -1118,13 +1143,28 @@ mod tests {
 
     #[test]
     fn daemon_stop_says_how_to_finish_after_ctrl_c() {
-        let supervised = still_draining_message(7, true);
-        assert!(supervised.contains("pid 7") && supervised.contains("still finishing"));
-        assert!(
-            supervised.contains("run `citadel daemon stop` again"),
-            "{supervised}"
-        );
-        assert!(still_draining_message(7, false).contains("Nothing restarts it."));
+        use crate::daemon::supervision::Stopped;
+        for supervised in [true, false] {
+            let mut out = Vec::new();
+            let result = report_stopped(&mut out, Stopped::StillDraining { pid: 7, supervised });
+            let text = String::from_utf8(out).expect("utf8");
+            // The stop did not finish: exit non-zero, so `stop && start` does not run a start
+            // the still-running daemon would refuse.
+            let err = result.expect_err("an unfinished stop fails");
+            assert!(err.is::<SilentExit>(), "nothing more is printed: {err}");
+            assert_eq!(text.matches("Stopped waiting.").count(), 1, "{text}");
+            assert!(
+                text.contains("pid 7") && text.contains("still finishing"),
+                "{text}"
+            );
+            if supervised {
+                assert!(text.contains("run `citadel daemon stop` again"), "{text}");
+            } else {
+                assert!(text.contains("Nothing restarts it."), "{text}");
+            }
+        }
+        let mut out = Vec::new();
+        report_stopped(&mut out, Stopped::Stopped(7)).expect("a finished stop succeeds");
     }
 
     fn run_args(vault_dir: &std::path::Path, args: &[&str]) -> anyhow::Result<String> {

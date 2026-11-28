@@ -362,3 +362,25 @@ Remaining risk added by this review: on a supervised restart whose stop timed ou
 `KeepAlive` relaunch that lands between `restart`'s status read and `start_as`'s is
 reported as `StartFailed` (already running). After a binary swap launchd refuses that
 relaunch and systemd does not relaunch a clean exit, so the window is rarely reachable.
+
+## User decisions
+
+### `citadel daemon stop` exits 1 after Ctrl-C (`Stopped::StillDraining`)
+This was deferred from the second review. The user decided that a stop the user abandons with
+Ctrl-C fails:
+- The CLI prints the still-draining message once, then returns `cli::SilentExit`.
+- `main` maps `SilentExit` to exit status 1 and prints nothing more. There is no `Error: …`
+  line, so the message is not repeated and does not read like a crash.
+- Every other error keeps the `Error: {:?}` report that `fn main() -> anyhow::Result<()>`
+  printed before.
+- As a result, `citadel daemon stop && citadel daemon start` (doctor's restart hint) no
+  longer runs a start that the still-running daemon would refuse.
+
+Test: `cli::tests::daemon_stop_says_how_to_finish_after_ctrl_c` now drives
+`report_stopped`. It was red first ("an unfinished stop fails: ()") and is green now. It checks:
+- the result is an error of type `SilentExit`;
+- the message prints exactly once, both with and without a service;
+- a finished stop still succeeds.
+
+Live check: a stopped temp vault, with `citadel daemon stop; echo $?`, still exits 0. The
+Ctrl-C path itself needs a daemon in the middle of a Sync, so only the test covers it.
