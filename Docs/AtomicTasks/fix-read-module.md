@@ -202,4 +202,9 @@ Source: an independent `/code-review` of `116f42c..8804b47` (claude-opus-5-5, hi
 - *Partial-word search* (the review suggested an automatic `*` on the last word). This is a visible behaviour change and the review left it open, so it is recorded as a follow-up, not built.
 - *Health list order under the cap.* The server orders by URI, and the client re-sorts by `last_checked_at`. A list cut at 1000 can therefore miss the newest checks. That needs more than 1000 Stale/Error pages, and the count shows `1000+` when it happens. Follow-up: a server-side `order=last_checked` option.
 
-**Gate after the fixes:** see the next section.
+**Gate after the fixes:**
+- `cargo fmt --check`: OK.
+- `cargo clippy --all-targets -- -D warnings`: clean.
+- `cargo clippy --no-default-features --all-targets -- -D warnings`: clean.
+- `cargo test`: 320 lib tests plus 17 integration tests passed, 0 failed.
+- `dropped_sync_future` did not fail in this run.
