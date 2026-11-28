@@ -41,6 +41,7 @@ Follow `AtomicTasks -> LLMCode -> Checks -> HumanAudit` for every change:
    ```
    If any check fails, fix the root cause and re-run the full gate.
 4. **HumanAudit handoff:** Summarize changed files, exact command results, and any risks or assumptions; wait for human review before merging.
+5. **Release every binary change:** a PR that changes the shipped `citadel` binary (code, dependencies, embedded assets) also bumps the version, and once it merges, push its `vX.Y.Z` tag. Follow the Release Process in [Docs/SPEC.md](./Docs/SPEC.md): `citadel update` installs only tagged GitHub Releases, so an untagged change never reaches users. Docs- and CI-only PRs keep the version.
 
 ## Engineering Invariants
 - **Error handling:** Propagate errors with `Result`, `thiserror` (library modules), and `anyhow` (CLI/top-level); reserve `unwrap()` and `expect()` strictly for `#[cfg(test)]`.
