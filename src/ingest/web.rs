@@ -228,14 +228,20 @@ impl UrlPattern {
                 "include/exclude pattern must not be empty".into(),
             ));
         }
-        if let Some((_, after)) = text.split_once('?') {
-            if after.contains(['=', '&']) {
-                return Err(VaultError::Validation(format!(
-                    "pattern '{raw}' looks like it matches a query string; patterns match only \
-                     the URL path (any query string may follow a match), and '?' stands for one \
-                     path character"
-                )));
-            }
+        // A `?` followed by `=` or `&` within the same path segment reads as a query string; a
+        // `=` or `&` in a later segment is an ordinary path character.
+        let query_like = text.split('?').skip(1).any(|after| {
+            after
+                .split('/')
+                .next()
+                .is_some_and(|seg| seg.contains(['=', '&']))
+        });
+        if query_like {
+            return Err(VaultError::Validation(format!(
+                "pattern '{raw}' looks like it matches a query string; patterns match only \
+                 the URL path (any query string may follow a match), and '?' stands for one \
+                 path character"
+            )));
         }
         let body = if text.contains(['*', '?', '[']) {
             glob::Pattern::new(text).map_err(|err| {
@@ -293,9 +299,23 @@ fn encoded_literal(ch: char) -> String {
     if !encoded_in_path(ch) {
         return regex::escape(ch.encode_utf8(&mut [0u8; 4]));
     }
+    // `url` writes the escapes it adds in uppercase but keeps a link's own escapes as written,
+    // so match the hex digits in either case.
     ch.encode_utf8(&mut [0u8; 4])
         .bytes()
-        .map(|b| format!("%{b:02X}"))
+        .map(|b| {
+            let hex: String = format!("{b:02X}")
+                .chars()
+                .map(|d| {
+                    if d.is_ascii_alphabetic() {
+                        format!("[{d}{}]", d.to_ascii_lowercase())
+                    } else {
+                        d.to_string()
+                    }
+                })
+                .collect();
+            format!("%{hex}")
+        })
         .collect()
 }
 
@@ -1272,6 +1292,9 @@ mod scope_tests {
         row(ROOT, &["docs/v?"], &[], "https://ex.com/docs/v%C3%A9", true, true),
         row(ROOT, &["docs/[^a]*"], &[], "https://ex.com/docs/%5Ex", true, true),
         row(ROOT, &["docs/my%20*"], &[], "https://ex.com/docs/my%20a", true, true),
+        row(ROOT, &["docs/é*"], &[], "https://ex.com/docs/%c3%a9a", true, true),
+        // `=` or `&` after a `?` in a later segment is a path character, not a query string.
+        row(ROOT, &["wiki/v?/a=b"], &[], "https://ex.com/wiki/v1/a=b", true, true),
         // An absolute pattern's scheme and host are case-insensitive; a default port is implied.
         row(ROOT, &["HTTPS://Ex.com/docs"], &[], "https://ex.com/docs/a", true, true),
         row(ROOT, &["https://ex.com:443/docs/*"], &[], "https://ex.com/docs/a", true, true),
@@ -1457,6 +1480,7 @@ mod scope_tests {
             "https://ex.com/search?q=rust",
             "search?q=*",
             "list?a=1&b=*",
+            "docs/v?/x?q=1",
             // Classes that a percent-encoded path cannot express as one character.
             "docs/[!é]*",
             "docs/[ -~]*",

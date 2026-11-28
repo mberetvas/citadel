@@ -112,3 +112,16 @@ Choice for finding 2: rejection, not literal query matching. Every other part of
 Remaining risk:
 - A stored web Source with a query-like pattern now fails its Sync with a validation error. Updating its patterns fixes it.
 - A literal `%` in a pattern is kept as written. A hand-encoded `%c3` (lowercase hex) does not match the uppercase hex that `url` emits, but URLs a site links to can keep their own casing.
+
+## Second review
+
+Source: the second `/code-review medium --fix` of `116f42c..433193b`.
+
+| # | Finding | Outcome | Evidence |
+|---|---|---|---|
+| 1 | (important) A stored web Source whose patterns the new parser rejects fails every Sync before a Sync run starts, so it never shows `error` | **Not applied: false positive** | `sync_web_source` runs only through `SourceLifecycle::run_sync`. `sync_record` turns any early error into an error Sync run and `status = 'error'` (`record_sync_failure`). No `web_sync_summary` line is logged when the Origin checks fail, as documented. The real effect, a Source in `error` until its patterns are updated, is already listed under remaining risk. |
+| 2 | The query-string check reads everything after the first `?`, so `wiki/v?/a=b` is rejected | **Applied** | `UrlPattern::parse` now rejects only a `?` followed by `=` or `&` in the same path segment, for every `?`. Rows: `wiki/v?/a=b` accepted; `docs/v?/x?q=1` rejected. SPEC §4.1 updated. |
+| 3 | Escapes a pattern adds match only uppercase hex, but `url` keeps a link's own escapes as written | **Applied** | `encoded_literal` emits `%[Cc]3%[Aa]9`. Row: `docs/é*` matches `/docs/%c3%a9a` (store and crawl). SPEC §4.1 updated. A hand-encoded escape in a pattern is still matched as written. |
+| 4 | An absolute pattern with a non-ASCII (punycode) or IPv6 host never matches | **Deferred: follow-up** | It needs absolute patterns to parse their authority with `Url::parse` and glob only the path, which changes what `*` means in a host. Rare. |
+| 5 | No version bump | **Deferred** by instruction | The bump and the `vX.Y.Z` tag happen once, at merge. |
+| 6 | A prefix pattern with `#` (`guide#legacy`) is encoded to `%23` and no longer matches the fragment URL | **Deferred: needs a decision** | Rejecting `#` (as with query patterns) or documenting it both change behavior. Fragments name the same page, so the impact is small. |
