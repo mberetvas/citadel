@@ -10,11 +10,13 @@
 
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hasher};
+use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{params, Connection, OptionalExtension};
 
+use crate::db::open_rw_db;
 use crate::error::Result;
 
 /// Hard age limit after which any claim may be taken over.
@@ -151,6 +153,68 @@ pub(crate) fn try_acquire(conn: &Connection, source_id: i64, env: &ClaimEnv) -> 
         reset_interrupted_sync(conn, source_id)?;
     }
     Ok(taken == 1)
+}
+
+/// A held Sync claim. It is built in the same synchronous code that commits the claim row,
+/// so no await can separate the row from its guard; dropping the guard releases the claim.
+#[derive(Debug)]
+pub(crate) struct ClaimGuard {
+    db_path: PathBuf,
+    env: ClaimEnv,
+    source_id: i64,
+    held: bool,
+}
+
+impl ClaimGuard {
+    /// Take the claim on `source_id`, or `None` when another live Sync holds it.
+    pub(crate) fn acquire(
+        conn: &Connection,
+        db_path: PathBuf,
+        source_id: i64,
+        env: &ClaimEnv,
+    ) -> Result<Option<Self>> {
+        if !try_acquire(conn, source_id, env)? {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            db_path,
+            env: env.clone(),
+            source_id,
+            held: true,
+        }))
+    }
+
+    /// Release the claim now, on `conn`.
+    pub(crate) fn release(mut self, conn: &Connection) -> Result<()> {
+        self.held = false;
+        release(conn, self.source_id, &self.env)
+    }
+
+    /// The claim row is already gone: deleting the Source cascaded it away.
+    pub(crate) fn forget(mut self) {
+        self.held = false;
+    }
+}
+
+impl Drop for ClaimGuard {
+    fn drop(&mut self) {
+        if !self.held {
+            return;
+        }
+        let (db_path, env, id) = (self.db_path.clone(), self.env.clone(), self.source_id);
+        let release = move || {
+            let result = open_rw_db(&db_path).and_then(|conn| release(&conn, id, &env));
+            if let Err(err) = result {
+                tracing::warn!(source_id = id, error = %err, "failed to release sync claim");
+            }
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn_blocking(release);
+            }
+            Err(_) => release(),
+        }
+    }
 }
 
 /// Release our claim on `source_id` and reset any Sync status it left unfinished.

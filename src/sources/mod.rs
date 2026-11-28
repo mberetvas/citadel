@@ -21,7 +21,7 @@ use crate::ingest::{
 mod claim;
 pub(crate) mod origin;
 
-use claim::ClaimEnv;
+use claim::{ClaimEnv, ClaimGuard};
 
 use origin::{check_private_origin, classify_origin};
 
@@ -34,6 +34,38 @@ const MAX_ALLOWED_DEPTH: u32 = 20;
 pub struct SourceLifecycle {
     config: VaultConfig,
     claims: ClaimEnv,
+    probe: Probe,
+}
+
+/// A point inside a Sync's blocking work where tests can pause it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Stage {
+    /// The Source row was loaded; no claim taken yet.
+    Loaded,
+    /// The Sync claim row is committed.
+    Claimed,
+}
+
+/// Test seam: called synchronously at each [`Stage`]. Always empty in production.
+#[derive(Clone, Default)]
+struct Probe(Option<std::sync::Arc<dyn Fn(Stage) + Send + Sync>>);
+
+impl Probe {
+    fn at(&self, stage: Stage) {
+        if let Some(probe) = &self.0 {
+            probe(stage);
+        }
+    }
+}
+
+impl std::fmt::Debug for Probe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_some() {
+            "Probe(set)"
+        } else {
+            "Probe(none)"
+        })
+    }
 }
 
 /// A newly registered Source and, when synced immediately, its first Sync summary.
@@ -81,7 +113,15 @@ impl SourceLifecycle {
         Self {
             config,
             claims: ClaimEnv::current(),
+            probe: Probe::default(),
         }
+    }
+
+    /// Pause points for tests: `probe` runs synchronously at every [`Stage`].
+    #[cfg(test)]
+    pub(crate) fn with_probe(mut self, probe: impl Fn(Stage) + Send + Sync + 'static) -> Self {
+        self.probe = Probe(Some(std::sync::Arc::new(probe)));
+        self
     }
 
     /// Register a new Source and optionally run its first Sync.
@@ -124,7 +164,9 @@ impl SourceLifecycle {
         match blocking(move || remove_source(&config, &name)).await {
             Ok(removed) => {
                 // Deleting the Source cascaded its claim row away.
-                claimed.released = true;
+                if let Some(guard) = claimed.guard.take() {
+                    guard.forget();
+                }
                 Ok(Removal::Removed(removed))
             }
             Err(err) => {
@@ -177,12 +219,15 @@ impl SourceLifecycle {
     pub async fn claim(&self, name: &str) -> Result<Option<ClaimedSync>> {
         let config = self.config.clone();
         let name = name.to_string();
+        let probe = self.probe.clone();
         let source = blocking(move || {
             if !config.db_path().exists() {
                 return Err(VaultError::NotFound(format!("source '{name}' not found")));
             }
             let conn = open_rw_db(&config.db_path())?;
-            load_source_by_name(&conn, &name)
+            let source = load_source_by_name(&conn, &name)?;
+            probe.at(Stage::Loaded);
+            Ok(source)
         })
         .await?;
         self.claim_record(source).await
@@ -194,7 +239,11 @@ impl SourceLifecycle {
         let config = self.config.clone();
         let env = self.claims.clone();
         let id = source.id;
-        let claimed = blocking(move || {
+        let probe = self.probe.clone();
+        let lifecycle = self.clone();
+        // The guard is built inside this hop, so a caller dropped while it runs cannot leave
+        // a claim row without one: the dropped result releases it.
+        blocking(move || {
             let conn = open_rw_db(&config.db_path())?;
             let not_found = || VaultError::NotFound(format!("source '{}' not found", source.name));
             let exists: bool = conn.query_row(
@@ -205,23 +254,18 @@ impl SourceLifecycle {
             if !exists {
                 return Err(not_found());
             }
-            if !claim::try_acquire(&conn, id, &env)? {
+            let Some(guard) = ClaimGuard::acquire(&conn, config.db_path(), id, &env)? else {
                 return Ok(None);
-            }
-            match load_source_by_id(&conn, id) {
-                Ok(fresh) => Ok(Some(fresh)),
-                Err(err) => {
-                    claim::release(&conn, id, &env)?;
-                    Err(err)
-                }
-            }
+            };
+            probe.at(Stage::Claimed);
+            let source = load_source_by_id(&conn, id)?;
+            Ok(Some(ClaimedSync {
+                lifecycle,
+                source,
+                guard: Some(guard),
+            }))
         })
-        .await?;
-        Ok(claimed.map(|source| ClaimedSync {
-            lifecycle: self.clone(),
-            source,
-            released: false,
-        }))
+        .await
     }
 
     /// Run one Sync of a claimed Source. Any failure, whether before or during the walk
@@ -288,7 +332,7 @@ impl SourceLifecycle {
 pub struct ClaimedSync {
     lifecycle: SourceLifecycle,
     source: SourceRecord,
-    released: bool,
+    guard: Option<ClaimGuard>,
 }
 
 impl ClaimedSync {
@@ -316,45 +360,18 @@ impl ClaimedSync {
     /// Release the claim now. A failure is logged, never returned: the Sync's own result
     /// is what callers report.
     pub(crate) async fn release(&mut self) {
-        self.released = true;
-        let (config, env, id) = self.release_parts();
+        let Some(guard) = self.guard.take() else {
+            return;
+        };
+        let config = self.lifecycle.config.clone();
+        let id = self.source.id;
         let released = blocking(move || {
             let conn = open_rw_db(&config.db_path())?;
-            claim::release(&conn, id, &env)
+            guard.release(&conn)
         })
         .await;
         if let Err(err) = released {
             tracing::warn!(source_id = id, error = %err, "failed to release sync claim");
-        }
-    }
-
-    fn release_parts(&self) -> (VaultConfig, ClaimEnv, i64) {
-        (
-            self.lifecycle.config.clone(),
-            self.lifecycle.claims.clone(),
-            self.source.id,
-        )
-    }
-}
-
-impl Drop for ClaimedSync {
-    fn drop(&mut self) {
-        if self.released {
-            return;
-        }
-        let (config, env, id) = self.release_parts();
-        let release = move || {
-            let result =
-                open_rw_db(&config.db_path()).and_then(|conn| claim::release(&conn, id, &env));
-            if let Err(err) = result {
-                tracing::warn!(source_id = id, error = %err, "failed to release sync claim");
-            }
-        };
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) => {
-                handle.spawn_blocking(release);
-            }
-            Err(_) => release(),
         }
     }
 }
