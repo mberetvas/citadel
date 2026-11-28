@@ -220,7 +220,7 @@ So `enable` stays on the reload path and its error is propagated.
 - **Doctor:**
   - The daemon-version hint is always `citadel daemon stop && citadel daemon start`.
   - A service file that is present but not loaded is `·` info with hint `citadel daemon start`. It used to be a warn with hint `citadel daemon install`.
-  - systemd "loaded" means `is-enabled`, not `is-active`.
+  - ~~systemd "loaded" means `is-enabled`, not `is-active`.~~ Reverted after the review: it is `is-active` again (see Review fixes, finding 5).
 - **`citadel daemon start` through the service** prints "Started citadel daemon through its OS service (pid …, log: …)."
 - **`citadel daemon install` on Linux** runs `enable` and then `restart`, instead of `enable --now`.
 
@@ -228,3 +228,64 @@ So `enable` stays on the reload path and its error is propagated.
 - Supervised paths were exercised through the fake adapter only. No live launchd or systemd run was made against the citadel job, as the brief forbids.
 - The CLI smoke test used a temp `HOME`/`CITADEL_HOME` with no service: start, status, a second start (refused), stop, a second stop, and `doctor`.
 - The Linux adapters and install code now compile on macOS too: only the choice of adapter is behind `cfg`. Linux behaviour itself was not run.
+
+## Review fixes
+
+Review of `116f42c..75098fa` (claude-opus-5-5, `/code-review` medium). Every bug test was red
+before its fix. The fake was changed first so that it models reality: a service stop
+SIGKILLs a daemon that is still finishing a Sync, as launchd (`ExitTimeOut`) and systemd
+(`TimeoutStopSec`) do; KeepAlive can relaunch after a delay; Sync state is per daemon; and a
+service file can name no vault.
+
+| # | Finding | Status | Commit | Red → green test |
+|---|---|---|---|---|
+| 1 | A supervised stop SIGKILLs a daemon finishing a Sync (blocker) | Fixed: drain first | 947cace | `daemon::supervision::tests::supervised_stop_lets_the_daemon_finish_its_sync`, `restart_leaves_a_daemon_finishing_a_sync_alone` (now asserts `!killed_mid_sync`); new green: `supervised_stop_stops_the_service_once_the_daemon_has_drained` |
+| 2 | `stop` fails on `Running(0)` after the service is already stopped | Fixed: waits for the pid, before touching the service | 947cace | `stop_waits_for_a_daemon_to_write_its_pid` |
+| 3 | The relaunch grace was dropped from the unsupervised restart | Fixed: 1 s `RELAUNCH_GRACE` before spawning | 947cace | `restart_waits_for_a_relaunch_before_spawning` (fake: plist naming no vault, relaunch after 100 ms) |
+| 4 | Unloaded-service hint ignores a data-dir mismatch | Fixed: `daemon start` only for this vault, else `daemon install` | 8ada4d8 | `doctor::running::tests::service_not_loaded_for_another_vault_hints_install` |
+| 5 | systemd "loaded = enabled" makes doctor show OK while the daemon is down | Fixed: `is-active` again (supervision no longer depends on it); comment reworded | 8ada4d8 | `daemon::service::tests::systemd_loaded_means_active` |
+| 6 | No version bump | Skipped, as instructed: bump and tag at merge time | — | — |
+| C1 | `Fake::start` propagates its own stop error; `Launchd::reload` ignores a failed `bootout` | Fixed | 947cace (the c58c298 message says it landed there; it landed in 947cace) | covered by the existing restart tests |
+| C2 | `supervised()` runs a subprocess it does not need | Fixed: `ServiceManager::file_data_dir` reads only the file | c58c298 | `deciding_supervision_does_not_ask_the_manager` |
+| B1 | `daemon start` fails with no reachable manager | Kept: falling back would reintroduce claim 4a. The error now names `citadel daemon start --foreground` | c58c298 | `start_names_the_foreground_escape_when_the_service_cannot_start` |
+| B2 | Supervised means installed, not loaded or enabled | Kept, as documented in Design decisions | — | `only_this_vaults_service_supervises_its_daemon` |
+| B3 | Linux `daemon install` now `restart`s a running daemon | Deferred, see follow-ups | — | — |
+
+### Finding 1: drain first, not stop timeouts
+I chose suggestion (b), drain first, over (a), a long `ExitTimeOut` / `TimeoutStopSec` with
+`--no-block`, for three reasons:
+- **It works for already-installed jobs.** Their plists and units are not rewritten until
+  `citadel daemon install` runs again; (a) would protect only new installs, or would need
+  users to reinstall.
+- **On timeout it falls back to the pre-branch behaviour.** A daemon still syncing after 5 s
+  is left running, service and all. The stop or update reports it, and the service relaunches
+  the daemon once its Sync is done (on the new binary, or launchd refuses it after a swap,
+  and `citadel daemon start` then reloads it).
+- **No CLI call blocks for 90 s** on `systemctl stop`: the service is stopped only after the
+  daemon has exited.
+
+How the stop now runs:
+1. Send SIGTERM to the daemon.
+2. Wait up to 5 s for the lock to be released, or to be taken by a KeepAlive relaunch.
+3. Only then stop the service. That ends a relaunched daemon while it is still idle.
+
+The update warning for a daemon that has not stopped now says that its service may relaunch
+it on the new version.
+
+### Follow-ups (deferred, not widened here)
+- **`citadel daemon install` while a Sync runs.**
+  - On macOS, `Launchd::reload` boots out a running job, and launchd SIGKILLs it after
+    `ExitTimeOut`. On `main`, `unload` ended it after about 5 s, so this was already there
+    before this branch.
+  - On Linux, `systemctl restart` sends SIGTERM and waits for `TimeoutStopSec` (90 s by
+    default) before SIGKILL, so a Sync shorter than that finishes.
+  - A fix would drain through `Supervision::stop` before reloading. It is out of this
+    review's scope.
+- **Version bump at merge** (finding 6).
+
+### Remaining risks
+- Supervised paths are tested through the fake only. No live launchd or systemd run touched
+  the citadel job.
+- The drain-first stop relies on KeepAlive leaving a gap in which the service stop ends the
+  relaunched daemon. The service stop and `wait_until_free` cover it, but a real launchd job
+  was not exercised.
