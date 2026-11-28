@@ -544,7 +544,7 @@ Running `citadel setup` in an interactive TTY launches a guided `cliclack` wizar
 | `POST /api/sources` | Add a web URL or local Markdown folder |
 | `DELETE /api/sources/:id` | Delete a source |
 | `POST /api/sources/:id/sync` | Trigger async background sync for a source |
-| `GET /api/pages` | List Pages of every Source, or of one with `?source=<id or name>`; `?status=` takes a comma-separated subset of `active,stale,error`; `?q=` searches; `?limit=` caps the list (1–10000, default 1000) and the response header `X-Citadel-Truncated: true` marks a list cut at its limit. Each item carries `source_name`, `http_status` and `error_message` |
+| `GET /api/pages` | List Pages of every Source, or of one with `?source=<id or name>`; `?status=` takes a comma-separated subset of `active,stale,error`; `?q=` searches; `?order=checked` lists the newest check first (default `uri`: search rank, then URI), applied before the cut; `?limit=` caps the list (1–10000, default 1000) and the response header `X-Citadel-Truncated: true` marks a list cut at its limit. Each item carries `source_name`, `http_status` and `error_message` |
 | `GET /api/sources/:id/pages` | Same list for the Source in the path (same filters and response) |
 | `GET /api/pages/:id` | Full page Markdown + sections + metadata |
 | `GET /api/pages/:id/diff` | Latest unified diff from `page_revisions` |
@@ -562,7 +562,7 @@ Page lists come from `ingest::read` (`src/ingest/read.rs`), which the CLI (`list
 ### UI Views (Lightweight Vanilla JS / Minimal CSS)
 1. **Sources:** Table of web + local sources, status badges, last-synced time, quick Add modal, Sync/Delete actions (with a subtle header badge when `GET /api/version` reports an update available).
 2. **Knowledge Browser:** Filter by source (or All sources), status or search through `GET /api/pages` (a count of `1000+` means the list was cut; a superseded search's response is dropped), inspect rendered/raw Markdown and heading sections.
-3. **Changes & Health:** Recent diffs (`v_recent_changes`) with colored unified diff viewer + list of `stale`/`error` pages (`GET /api/pages?status=stale,error`, newest check first).
+3. **Changes & Health:** Recent diffs (`v_recent_changes`) with colored unified diff viewer + list of `stale`/`error` pages (`GET /api/pages?status=stale,error&order=checked`, newest check first).
 4. **SQL Explorer:** Interactive read-only query box using the exact same `query` engine as the MCP server.
 
 ---

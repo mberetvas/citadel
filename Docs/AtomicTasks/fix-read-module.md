@@ -208,3 +208,16 @@ Source: an independent `/code-review` of `116f42c..8804b47` (claude-opus-5-5, hi
 - `cargo clippy --no-default-features --all-targets -- -D warnings`: clean.
 - `cargo test`: 320 lib tests plus 17 integration tests passed, 0 failed.
 - `dropped_sync_future` did not fail in this run.
+
+## Second review
+
+Source: `/code-review medium --fix` of `116f42c..HEAD` (claude-opus-5-5), with each applied fix checked by hand.
+
+- **Important — Health list lost its newest checks under the cap** (`src/ui/assets/app.js:1046`): **applied.** The server sorted by URI and cut the list at 1000 before the client re-sorted by `last_checked_at`. A new `PageOrder::NewestChecked` (`?order=checked`; unknown values return 400) orders by `last_checked_at DESC, uri` before the `LIMIT`. The Health view requests it and no longer sorts on its own. This resolves the "Health list order under the cap" item that the first round deferred. Tests: `ingest::read::tests::newest_checked_order_keeps_the_newest_checks_under_a_limit`; `ui::tests` check that `?order=newest` returns 400 and that app.js asks for `order=checked`.
+- **Nit — version still 0.4.1** (`Cargo.toml:3`): **not applied, as instructed.** The bump and the tag happen once, at merge time.
+
+**Gate after the fixes:**
+- `cargo fmt --check`: OK.
+- `cargo clippy --all-targets -- -D warnings`: clean.
+- `cargo clippy --no-default-features --all-targets -- -D warnings`: clean.
+- `cargo test`: 321 lib tests plus 17 integration tests passed, 0 failed. `dropped_sync_future` did not fail in this run.

@@ -9,7 +9,8 @@ use serde_json::json;
 use crate::db::readonly::{execute_readonly_query, QueryResult};
 use crate::error::{Result, VaultError};
 use crate::ingest::{
-    self, PageListItem, PageQuery, PageStatuses, SourceRecord, SourceSummary, SyncSummary,
+    self, PageListItem, PageOrder, PageQuery, PageStatuses, SourceRecord, SourceSummary,
+    SyncSummary,
 };
 use crate::sources::{AddSourceParams, Removal, RemovedSource, SourceLifecycle};
 use crate::ui::UiState;
@@ -102,6 +103,8 @@ pub struct ListPagesQuery {
     pub q: Option<String>,
     /// At most this many Pages (1..=10000, default 1000).
     pub limit: Option<u32>,
+    /// `uri` (default; search rank first when searching) or `checked` (newest check first).
+    pub order: Option<String>,
 }
 
 /// Default and largest `limit` for a Page list.
@@ -323,6 +326,7 @@ async fn read_pages(
     query: ListPagesQuery,
 ) -> ApiResult<PageListResponse> {
     let statuses = PageStatuses::parse(query.status.as_deref().unwrap_or(""))?;
+    let order = PageOrder::parse(query.order.as_deref().unwrap_or(""))?;
     let limit = query.limit.unwrap_or(DEFAULT_PAGE_LIMIT);
     if !(1..=MAX_PAGE_LIMIT).contains(&limit) {
         return Err(VaultError::Validation(format!(
@@ -344,6 +348,7 @@ async fn read_pages(
                 search: query.q,
                 // One extra row tells a cut list from one that exactly fits.
                 limit: Some(limit + 1),
+                order,
             },
         )
     })

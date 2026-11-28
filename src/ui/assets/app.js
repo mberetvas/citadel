@@ -1043,10 +1043,9 @@
     const tbody = el("health-tbody");
     const countEl = el("health-count");
     try {
-      const list = await fetchPageList("/api/pages?status=stale,error");
-      const rows = list.pages.sort((a, b) =>
-        String(b.last_checked_at || "").localeCompare(String(a.last_checked_at || ""))
-      );
+      // The server orders before it cuts, so a cut list keeps the newest checks.
+      const list = await fetchPageList("/api/pages?status=stale,error&order=checked");
+      const rows = list.pages;
       countEl.textContent = formatPageCount(list);
 
       if (!rows.length) {

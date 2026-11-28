@@ -697,7 +697,11 @@ mod tests {
         assert_eq!(by_param, by_path);
 
         // Same validation on both endpoints.
-        for uri in ["/api/pages?status=gone", "/api/sources/1/pages?status=gone"] {
+        for uri in [
+            "/api/pages?status=gone",
+            "/api/sources/1/pages?status=gone",
+            "/api/pages?order=newest",
+        ] {
             let (status, _) = get_json(&app, uri).await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
         }
@@ -986,7 +990,7 @@ mod tests {
         assert!(app_js.contains("/api/pages"), "app.js must use /api/pages");
         // A cut list is shown as such, and a superseded Browser search cannot
         // overwrite a newer one.
-        for expected in ["X-Citadel-Truncated", "browserSearchSeq"] {
+        for expected in ["X-Citadel-Truncated", "browserSearchSeq", "order=checked"] {
             assert!(app_js.contains(expected), "app.js missing `{expected}`");
         }
         // The Browser and the Health list no longer build SQL in the client, and the

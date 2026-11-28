@@ -91,6 +91,30 @@ pub struct PageQuery {
     pub search: Option<String>,
     /// At most this many Pages, in list order; every match when `None`.
     pub limit: Option<u32>,
+    pub order: PageOrder,
+}
+
+/// The order of a Page list.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PageOrder {
+    /// By search rank when searching, then by URI.
+    #[default]
+    Uri,
+    /// Newest `last_checked_at` first, then by URI (a search does not rank).
+    NewestChecked,
+}
+
+impl PageOrder {
+    /// Parse `uri` or `checked`; blank means `uri`.
+    pub fn parse(raw: &str) -> Result<Self> {
+        match raw.trim() {
+            "" | "uri" => Ok(Self::Uri),
+            "checked" => Ok(Self::NewestChecked),
+            other => Err(VaultError::Validation(format!(
+                "invalid page order '{other}'; expected one of: uri, checked"
+            ))),
+        }
+    }
 }
 
 const SOURCE_COLUMNS: &str = "id, name, kind, origin, tags, include_patterns, exclude_patterns,
@@ -132,7 +156,7 @@ fn query_pages(conn: &Connection, query: &PageQuery) -> Result<Vec<PageListItem>
         binds.push(phrases);
         binds.push(pattern);
     }
-    let mut sql = page_list_sql(search.is_some());
+    let mut sql = page_list_sql(search.is_some(), query.order);
     if let Some(limit) = &query.limit {
         // `?` takes the next number after the highest bound so far.
         sql.push_str(" LIMIT ?");
@@ -147,9 +171,14 @@ fn query_pages(conn: &Connection, query: &PageQuery) -> Result<Vec<PageListItem>
 
 /// The Page list SQL. Binds: `?1` source id, `?2..?5` status flags, and with a
 /// search, `?6` the FTS5 phrases and `?7` the URI `LIKE` pattern.
-fn page_list_sql(with_search: bool) -> String {
+fn page_list_sql(with_search: bool, order: PageOrder) -> String {
+    let order_by = match (order, with_search) {
+        (PageOrder::NewestChecked, _) => "p.last_checked_at DESC, p.uri ASC",
+        (PageOrder::Uri, true) => "m.rank IS NULL, m.rank, p.uri ASC",
+        (PageOrder::Uri, false) => "p.uri ASC",
+    };
     if !with_search {
-        return format!("{PAGE_LIST_SELECT} WHERE {PAGE_LIST_FILTER} ORDER BY p.uri ASC");
+        return format!("{PAGE_LIST_SELECT} WHERE {PAGE_LIST_FILTER} ORDER BY {order_by}");
     }
     // MATERIALIZED runs the MATCH once; flattened into the join, SQLite would run one
     // FTS lookup per Page row (a short prefix took minutes on 10k Pages).
@@ -162,7 +191,7 @@ fn page_list_sql(with_search: bool) -> String {
          LEFT JOIN m ON m.page_id = p.id
          WHERE {PAGE_LIST_FILTER}
            AND (m.page_id IS NOT NULL OR p.uri LIKE ?7 ESCAPE '\\')
-         ORDER BY m.rank IS NULL, m.rank, p.uri ASC"
+         ORDER BY {order_by}"
     )
 }
 
@@ -280,6 +309,7 @@ fn select_source_detail(conn: &Connection, name: &str) -> Result<SourceDetail> {
             statuses: PageStatuses::STALE_OR_ERROR,
             search: None,
             limit: None,
+            order: PageOrder::Uri,
         },
     )?;
 
@@ -604,6 +634,31 @@ mod tests {
     }
 
     #[test]
+    fn newest_checked_order_keeps_the_newest_checks_under_a_limit() {
+        let (_dir, config) = seeded_vault();
+        let newest = list_pages(
+            &config,
+            &PageQuery {
+                statuses: PageStatuses::STALE_OR_ERROR,
+                limit: Some(1),
+                order: PageOrder::NewestChecked,
+                ..PageQuery::default()
+            },
+        )
+        .expect("newest checked");
+        assert_eq!(
+            uris(&newest),
+            vec!["https://alpha.example.com/api/v2/missing"]
+        );
+        assert_eq!(
+            PageOrder::parse("checked").expect("parse"),
+            PageOrder::NewestChecked
+        );
+        assert_eq!(PageOrder::parse("").expect("parse blank"), PageOrder::Uri);
+        assert!(PageOrder::parse("newest").is_err());
+    }
+
+    #[test]
     fn filters_pages_by_source_and_status_set() {
         let (_dir, config) = seeded_vault();
         let issues = list_pages(
@@ -694,7 +749,10 @@ mod tests {
         let (_dir, config) = seeded_vault();
         let conn = open_rw_db(&config.db_path()).expect("open_rw_db");
         let plan: Vec<String> = conn
-            .prepare(&format!("EXPLAIN QUERY PLAN {}", page_list_sql(true)))
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN {}",
+                page_list_sql(true, PageOrder::Uri)
+            ))
             .expect("prepare plan")
             .query_map(
                 rusqlite::params![

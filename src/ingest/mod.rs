@@ -19,7 +19,7 @@ pub use normalize::{
 pub use persist::SyncSummary;
 pub use read::{
     all_sources, due_web_sources, find_source, list_pages, list_sources, show_source, PageListItem,
-    PageQuery, PageStatuses,
+    PageOrder, PageQuery, PageStatuses,
 };
 pub(crate) use read::{load_all_sources, load_source_by_id, load_source_by_name, read_vault};
 pub use sections::{split_sections, SectionChunk};
