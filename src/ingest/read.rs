@@ -9,7 +9,10 @@ use std::time::{Duration, Instant};
 use rusqlite::{params_from_iter, Connection, ErrorCode, OpenFlags, OptionalExtension, Row, ToSql};
 use serde::{Deserialize, Serialize};
 
-use super::{SourceDetail, SourceKind, SourceRecord, SourceSummary, SyncRunRecord};
+use super::{
+    SourceDetail, SourceKind, SourceRecord, SourceSummary, SyncRunRecord, DEFAULT_MAX_DEPTH,
+    DEFAULT_MAX_PAGES,
+};
 use crate::config::VaultConfig;
 use crate::db::DEFAULT_QUERY_TIMEOUT_MS;
 use crate::error::{Result, VaultError};
@@ -425,8 +428,8 @@ fn map_source_record(row: &Row<'_>) -> rusqlite::Result<SourceRecord> {
         tags: json_list(row, "tags")?,
         include_patterns: json_list(row, "include_patterns")?,
         exclude_patterns: json_list(row, "exclude_patterns")?,
-        max_pages: stored_limit(row, "max_pages")?,
-        max_depth: stored_limit(row, "max_depth")?,
+        max_pages: stored_limit(row, "max_pages", DEFAULT_MAX_PAGES)?,
+        max_depth: stored_limit(row, "max_depth", DEFAULT_MAX_DEPTH)?,
         render_js: row.get::<_, i64>("render_js")? != 0,
         refresh_interval_secs: row.get("refresh_interval_secs")?,
         status: row.get("status")?,
@@ -461,16 +464,22 @@ fn map_source_summary(row: &Row<'_>) -> rusqlite::Result<SourceSummary> {
     })
 }
 
-/// A stored `max_pages`/`max_depth`; out of `u32` range is an error, not a silent default.
-fn stored_limit(row: &Row<'_>, column: &str) -> rusqlite::Result<u32> {
+/// A stored `max_pages`/`max_depth`. A value outside `u32` (only a hand edit of
+/// `vault.db` can store one) is logged and read as `default`, so one bad row cannot
+/// break every Source list, the scheduler, the watcher or a delete.
+fn stored_limit(row: &Row<'_>, column: &str, default: u32) -> rusqlite::Result<u32> {
     let raw: i64 = row.get(column)?;
-    u32::try_from(raw).map_err(|_| {
-        conversion_error(
-            row,
+    Ok(u32::try_from(raw).unwrap_or_else(|_| {
+        let source_id: Option<i64> = row.get("id").ok();
+        tracing::warn!(
+            source_id,
             column,
-            format!("stored {column} {raw} is out of range").into(),
-        )
-    })
+            stored = raw,
+            default,
+            "stored Source limit is out of range; using the default"
+        );
+        default
+    }))
 }
 
 fn json_list(row: &Row<'_>, column: &str) -> rusqlite::Result<Vec<String>> {
@@ -478,6 +487,7 @@ fn json_list(row: &Row<'_>, column: &str) -> rusqlite::Result<Vec<String>> {
     serde_json::from_str(&raw).map_err(|e| conversion_error(row, column, Box::new(e)))
 }
 
+/// A conversion error for a TEXT column (`kind` and the JSON lists).
 fn conversion_error(
     row: &Row<'_>,
     column: &str,
@@ -772,15 +782,26 @@ mod tests {
     }
 
     #[test]
-    fn out_of_range_stored_limits_are_read_errors() {
+    fn out_of_range_stored_limit_does_not_break_other_reads() {
         let (_dir, config) = seeded_vault();
         let conn = open_rw_db(&config.db_path()).expect("open_rw_db");
-        conn.execute("UPDATE sources SET max_pages = -1 WHERE id = 1", [])
-            .expect("corrupt max_pages");
+        conn.execute(
+            "UPDATE sources SET max_pages = -1, max_depth = 5000000000,
+                                refresh_interval_secs = 60
+             WHERE id = 1",
+            [],
+        )
+        .expect("corrupt limits");
         drop(conn);
-        let err = find_source(&config, "alpha").expect_err("negative max_pages");
-        assert!(err.to_string().contains("max_pages"), "{err}");
-        assert!(list_sources(&config).is_err());
+
+        // The bad row reads with the defaults; every list, the scheduler's due read and
+        // the lookup that UI delete/sync use keep working.
+        let alpha = find_source(&config, "alpha").expect("lookup bad Source");
+        assert_eq!((alpha.max_pages, alpha.max_depth), (500, 5));
+        assert_eq!(list_sources(&config).expect("list").len(), 2);
+        assert_eq!(all_sources(&config).expect("all").len(), 2);
+        let due = due_web_sources(&config, i64::from(u32::MAX)).expect("due");
+        assert_eq!(due.len(), 1);
     }
 
     #[test]
