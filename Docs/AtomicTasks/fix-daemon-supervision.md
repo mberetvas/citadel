@@ -245,7 +245,7 @@ service file can name no vault.
 | 4 | Unloaded-service hint ignores a data-dir mismatch | Fixed: `daemon start` only for this vault, else `daemon install` | 8ada4d8 | `doctor::running::tests::service_not_loaded_for_another_vault_hints_install` |
 | 5 | systemd "loaded = enabled" makes doctor show OK while the daemon is down | Fixed: `is-active` again (supervision no longer depends on it); comment reworded | 8ada4d8 | `daemon::service::tests::systemd_loaded_means_active` |
 | 6 | No version bump | Skipped, as instructed: bump and tag at merge time | — | — |
-| C1 | `Fake::start` propagates its own stop error; `Launchd::reload` ignores a failed `bootout` | Fixed | 947cace (the c58c298 message says it landed there; it landed in 947cace) | covered by the existing restart tests |
+| C1 | `Fake::start` propagates its own stop error; `Launchd::reload` ignores a failed `bootout` | Fixed | 947cace (the c58c298 commit message wrongly claims it) | covered by the existing restart tests |
 | C2 | `supervised()` runs a subprocess it does not need | Fixed: `ServiceManager::file_data_dir` reads only the file | c58c298 | `deciding_supervision_does_not_ask_the_manager` |
 | B1 | `daemon start` fails with no reachable manager | Kept: falling back would reintroduce claim 4a. The error now names `citadel daemon start --foreground` | c58c298 | `start_names_the_foreground_escape_when_the_service_cannot_start` |
 | B2 | Supervised means installed, not loaded or enabled | Kept, as documented in Design decisions | — | `only_this_vaults_service_supervises_its_daemon` |
