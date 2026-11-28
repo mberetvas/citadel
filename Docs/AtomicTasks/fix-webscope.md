@@ -9,7 +9,7 @@ Evidence: the red table test `ingest::web::scope_tests::crawl_and_store_filters_
 For each pattern and URL, it compares `WebScope::should_store` with spider's own `Website::is_allowed_default`.
 That is the check spider runs before it fetches a link: `RegexSet::is_match` over the full absolute URL (spider 2.54.2, `website.rs:2223`).
 The test calls it on the crawler that `configure_website` builds, after `configure_allowlist()`.
-25 rows failed on `main`.
+19 rows failed on `main`; 6 of them are storable URLs that spider never crawls. A second red test, `tests::crawl_fetches_only_what_the_patterns_store` (a loopback-fixture crawl), also fails on `main`: with include `docs/[!d]*`, `/docs/api` is never fetched or stored.
 
 | # | Claim | Verdict | Evidence (pattern → URL: store / crawl on `main`) |
 |---|---|---|---|
@@ -43,7 +43,7 @@ WebScope parses each include/exclude pattern once, into one anchored URL regex. 
 
 1. `crawl_and_store_filters_agree` passes. For each row, the expected store result equals `should_store`, the expected crawl result equals spider's `is_allowed_default`, spider never drops a compiled set, and no storable URL is uncrawlable. The Origin page is the one deliberate exception: it is crawled for its links but not stored unless an include matches it.
 2. A differential test shows that a relative pattern's regex matches the same paths as `glob::Pattern::matches` (glob 0.3.4, default options) over a corpus that covers `*`, `?`, `**`, `[..]`, `[!..]`, `[^..]`, `[]..]`, ranges and reversed ranges.
-3. A loopback-fixture crawl with include `docs/[!d]*` and the pages `/docs/api`, `/docs/draft`, `/docs/x.mdx` and `/img/LOGO.PNG` stores and requests only `/docs/api` (plus the Origin).
+3. A loopback-fixture crawl with includes `docs/[!d]*` and `guide/*.md`, over the pages `/docs/api`, `/docs/draft`, `/guide/x.md`, `/guide/x.mdx` and `/img/LOGO.PNG`, stores and requests only `/docs/api` and `/guide/x.md` (plus the Origin, `robots.txt` and the discovery files).
 4. Adding or updating a web Source with a pattern its parser rejects fails with a validation error through `SourceLifecycle`. Local Sources keep the glob validation.
 5. `PatternMatcher` is no longer used by WebScope; `WebScope.matcher` and `web.rs:381` are gone; nothing rebuilds a matcher per URL.
 6. `Docs/SPEC.md` §4.1 documents the scope-pattern semantics.
@@ -77,4 +77,19 @@ spider receives the identical strings, so store ⊆ crawl holds by construction.
 - *Reject reversed ranges as invalid.* Glob accepts them, and local Sources share the pattern syntax. Matching nothing keeps one meaning for both kinds.
 - *Move `PatternMatcher` into a shared module.* Local Sources keep their glob matcher unchanged. Only WebScope stops using it, which keeps the diff out of `local.rs`.
 
-**Risk.** A web Source whose stored patterns used to fail open (for example `docs/[]a]*`) now gets a correct, narrower scope. On its next complete Sync, pages that only the open scope admitted go stale.
+**Risk: existing web Sources can change scope in both directions.**
+- **Narrower.** On the next complete Sync, the pages that leave the scope go stale.
+  - A Source whose patterns used to fail open, such as `docs/[]a]*` or `docs/[z-a]*`, gets its real scope.
+  - Relative patterns no longer match the full URL or the host: `*docs*` on `docs.ex.com` stops storing everything.
+  - `?` in an absolute pattern no longer matches the query separator.
+  - Wildcards stop at the query string.
+- **Wider.** New pages are stored.
+  - Excludes are end-anchored, so the exclude `docs/*.md` no longer blocks `.mdx`.
+  - `[!x]` and `**/` includes now admit what glob says they should.
+  - `/page?file=a.png` is no longer blacklisted.
+
+**Tests that were never red.** Three tests passed from the start:
+- `relative_pattern_regex_matches_like_glob` and `patterns_glob_rejects_are_validation_errors`, which pin the new parser.
+- `sources::tests::web_source_patterns_are_validated_on_add_and_update`.
+
+Every glob-valid pattern now translates to a regex, so the web parser accepts exactly the patterns that local validation accepts. The lifecycle wiring keeps validation and Sync on one parser; it does not fix a separate bug.
