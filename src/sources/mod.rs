@@ -20,10 +20,13 @@ use crate::ingest::{
 
 mod claim;
 pub(crate) mod origin;
+mod sync;
 
 use claim::{ClaimEnv, ClaimGuard};
 
 use origin::{check_private_origin, classify_origin};
+use sync::Target;
+pub use sync::{RunningSync, SyncHandle};
 
 const DEFAULT_REFRESH_INTERVAL_SECS: i64 = 86_400;
 const MAX_ALLOWED_PAGES: u32 = 5_000;
@@ -136,10 +139,11 @@ impl SourceLifecycle {
         }
 
         let id = source.id;
-        let summary = match self.claim_record(source).await? {
-            Some(claimed) => Some(claimed.run(false).await?),
-            None => None,
-        };
+        let summary = self
+            .start_sync_record(source, false)
+            .finish()
+            .await?
+            .synced();
         let config = self.config.clone();
         let source = blocking(move || {
             let conn = open_rw_db(&config.db_path())?;
@@ -156,32 +160,44 @@ impl SourceLifecycle {
 
     /// Remove a Source by name, cascading its stored Pages. Refused while it is syncing.
     pub async fn remove(&self, name: &str) -> Result<Removal> {
-        let Some(mut claimed) = self.claim(name).await? else {
+        let Some(guard) = self.claim(name).await? else {
             return Ok(Removal::AlreadySyncing);
         };
         let config = self.config.clone();
         let name = name.to_string();
-        match blocking(move || remove_source(&config, &name)).await {
-            Ok(removed) => {
-                // Deleting the Source cascaded its claim row away.
-                if let Some(guard) = claimed.guard.take() {
-                    guard.forget();
-                }
-                Ok(Removal::Removed(removed))
-            }
-            Err(err) => {
-                claimed.release().await;
-                Err(err)
-            }
-        }
+        // The guard moves into the hop, so the claim is held until the removal ends.
+        blocking(move || {
+            let removed = remove_source(&config, &name)?;
+            // Deleting the Source cascaded its claim row away.
+            guard.forget();
+            Ok(Removal::Removed(removed))
+        })
+        .await
     }
 
     /// Sync one Source by name, unless another Sync of it is running.
+    ///
+    /// The Sync runs as its own task: dropping this future (an HTTP client that disconnects,
+    /// a timed-out caller) neither cancels the Sync nor leaks its claim.
     pub async fn sync(&self, name: &str, prune: bool) -> Result<SyncOutcome> {
-        match self.claim(name).await? {
-            Some(claimed) => Ok(SyncOutcome::Synced(claimed.run(prune).await?)),
-            None => Ok(SyncOutcome::AlreadySyncing),
-        }
+        self.start_sync(name, prune).finish().await
+    }
+
+    /// Start a Sync of one Source by name as its own task, now. The handle reports whether
+    /// it took the Sync claim and how it ended; dropping it does not stop the Sync.
+    /// Must be called within a Tokio runtime.
+    pub fn start_sync(&self, name: &str, prune: bool) -> SyncHandle {
+        sync::start(self, Target::Name(name.to_string()), prune)
+    }
+
+    /// [`start_sync`](Self::start_sync) for a Source loaded earlier. A Source removed since
+    /// is `NotFound`; the Sync uses the Source's current settings.
+    pub(crate) fn start_sync_record(&self, source: SourceRecord, prune: bool) -> SyncHandle {
+        let target = Target::Record {
+            id: source.id,
+            name: source.name,
+        };
+        sync::start(self, target, prune)
     }
 
     /// Sync every registered Source in name order. Each Source gets its own result, so
@@ -200,70 +216,36 @@ impl SourceLifecycle {
         let mut results = Vec::with_capacity(sources.len());
         for source in sources {
             let name = source.name.clone();
-            let result = match self.claim_record(source).await {
-                Ok(Some(claimed)) => claimed.run(prune).await.map(SyncOutcome::Synced),
-                Ok(None) => Ok(SyncOutcome::AlreadySyncing),
+            let result = match self.start_sync_record(source, prune).finish().await {
                 Err(VaultError::NotFound(_)) => {
                     tracing::info!(source = %name, "skipped: removed during sync_all");
                     continue;
                 }
-                Err(err) => Err(err),
+                result => result,
             };
             results.push(SourceSyncResult { name, result });
         }
         Ok(results)
     }
 
-    /// Take the Sync claim on a Source so its Sync can run later via [`ClaimedSync::run`].
-    /// Returns `None` when another Sync holds it.
-    pub async fn claim(&self, name: &str) -> Result<Option<ClaimedSync>> {
+    /// Take the Sync claim on a Source without syncing it; `None` when a Sync holds it.
+    /// Dropping the guard releases the claim.
+    pub(crate) async fn claim(&self, name: &str) -> Result<Option<ClaimGuard>> {
         let config = self.config.clone();
-        let name = name.to_string();
+        let env = self.claims.clone();
         let probe = self.probe.clone();
-        let source = blocking(move || {
+        let name = name.to_string();
+        blocking(move || {
             if !config.db_path().exists() {
                 return Err(VaultError::NotFound(format!("source '{name}' not found")));
             }
             let conn = open_rw_db(&config.db_path())?;
-            let source = load_source_by_name(&conn, &name)?;
-            probe.at(Stage::Loaded);
-            Ok(source)
-        })
-        .await?;
-        self.claim_record(source).await
-    }
-
-    /// Claim a Source, then reload it so the Sync uses its current settings. A Source
-    /// removed since `source` was loaded is `NotFound`.
-    pub(crate) async fn claim_record(&self, source: SourceRecord) -> Result<Option<ClaimedSync>> {
-        let config = self.config.clone();
-        let env = self.claims.clone();
-        let id = source.id;
-        let probe = self.probe.clone();
-        let lifecycle = self.clone();
-        // The guard is built inside this hop, so a caller dropped while it runs cannot leave
-        // a claim row without one: the dropped result releases it.
-        blocking(move || {
-            let conn = open_rw_db(&config.db_path())?;
-            let not_found = || VaultError::NotFound(format!("source '{}' not found", source.name));
-            let exists: bool = conn.query_row(
-                "SELECT EXISTS (SELECT 1 FROM sources WHERE id = ?1)",
-                [id],
-                |r| r.get(0),
-            )?;
-            if !exists {
-                return Err(not_found());
+            let id = load_source_by_name(&conn, &name)?.id;
+            let guard = ClaimGuard::acquire(&conn, config.db_path(), id, &env)?;
+            if guard.is_some() {
+                probe.at(Stage::Claimed);
             }
-            let Some(guard) = ClaimGuard::acquire(&conn, config.db_path(), id, &env)? else {
-                return Ok(None);
-            };
-            probe.at(Stage::Claimed);
-            let source = load_source_by_id(&conn, id)?;
-            Ok(Some(ClaimedSync {
-                lifecycle,
-                source,
-                guard: Some(guard),
-            }))
+            Ok(guard)
         })
         .await
     }
@@ -322,56 +304,6 @@ impl SourceLifecycle {
                 check_private_origin(&source.origin, self.config.allow_private_origins)?;
                 sync_web_source(&self.config.db_path(), source, prune).await
             }
-        }
-    }
-}
-
-/// A held Sync claim on one Source. [`ClaimedSync::run`] runs the Sync and releases the
-/// claim; dropping it unrun releases the claim too.
-#[derive(Debug)]
-pub struct ClaimedSync {
-    lifecycle: SourceLifecycle,
-    source: SourceRecord,
-    guard: Option<ClaimGuard>,
-}
-
-impl ClaimedSync {
-    /// The claimed Source.
-    pub fn source(&self) -> &SourceRecord {
-        &self.source
-    }
-
-    /// Run the Sync, then release the claim whether it succeeded or failed.
-    ///
-    /// The Sync runs as its own task: dropping the returned future (an HTTP client that
-    /// disconnects, a timed-out caller) does not cancel a crawl half-way.
-    pub async fn run(self, prune: bool) -> Result<SyncSummary> {
-        tokio::spawn(self.run_to_completion(prune))
-            .await
-            .map_err(|err| VaultError::Other(format!("sync task failed: {err}")))?
-    }
-
-    async fn run_to_completion(mut self, prune: bool) -> Result<SyncSummary> {
-        let result = self.lifecycle.sync_record(&self.source, prune).await;
-        self.release().await;
-        result
-    }
-
-    /// Release the claim now. A failure is logged, never returned: the Sync's own result
-    /// is what callers report.
-    pub(crate) async fn release(&mut self) {
-        let Some(guard) = self.guard.take() else {
-            return;
-        };
-        let config = self.lifecycle.config.clone();
-        let id = self.source.id;
-        let released = blocking(move || {
-            let conn = open_rw_db(&config.db_path())?;
-            guard.release(&conn)
-        })
-        .await;
-        if let Err(err) = released {
-            tracing::warn!(source_id = id, error = %err, "failed to release sync claim");
         }
     }
 }

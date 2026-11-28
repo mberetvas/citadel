@@ -319,8 +319,20 @@ async fn remove_while_syncing_returns_already_syncing() {
         SyncOutcome::AlreadySyncing
     ));
 
-    let summary = held.run(false).await.expect("held sync runs");
-    assert_eq!(summary.pages_added, 1);
+    drop(held);
+    let mut outcome = SyncOutcome::AlreadySyncing;
+    for _ in 0..100 {
+        outcome = lifecycle.sync("busy", false).await.expect("sync");
+        if outcome != SyncOutcome::AlreadySyncing {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        synced(outcome).pages_added,
+        1,
+        "the dropped guard released the claim"
+    );
     assert!(matches!(
         lifecycle.remove("busy").await.expect("remove"),
         Removal::Removed(_)
@@ -388,14 +400,14 @@ async fn missing_local_folder_records_error_run() {
         .expect_err("missing folder must fail");
     assert_failure_recorded(&config, "via-sync");
 
-    // The path the UI and scheduler take: claim, then run. (The watcher calls `sync`.)
-    let claimed = lifecycle
-        .claim("via-claim")
+    // The path the UI and scheduler take: wait for the claim, then the end.
+    lifecycle
+        .start_sync("via-claim", false)
+        .claimed()
         .await
         .expect("claim")
-        .expect("free");
-    claimed
-        .run(false)
+        .expect("free")
+        .finish()
         .await
         .expect_err("missing folder must fail");
     assert_failure_recorded(&config, "via-claim");
@@ -481,7 +493,8 @@ async fn sync_all_skips_source_removed_mid_run() {
     .expect("load");
     ghost.id += 1_000;
     let err = lifecycle
-        .claim_record(ghost)
+        .start_sync_record(ghost, false)
+        .finish()
         .await
         .expect_err("ghost source");
     assert!(matches!(err, VaultError::NotFound(_)), "{err:?}");
@@ -513,7 +526,8 @@ async fn dropped_sync_future_still_finishes_in_background() {
             "params": {"name": "manage", "arguments": {"action": "sync", "name": "slow"}}
         }),
     );
-    let _ = tokio::time::timeout(std::time::Duration::from_millis(50), request).await;
+    // Poll the request exactly once, then drop it: the client is gone before any reply.
+    let _ = tokio::time::timeout(std::time::Duration::ZERO, request).await;
 
     let status = wait_for_status(&config, "slow", "ok").await;
     server.abort();
@@ -585,6 +599,59 @@ async fn local_source(lifecycle: &SourceLifecycle, name: &str) -> tempfile::Temp
     docs
 }
 
+/// Drop a `sync` caller while the Sync is paused at `stage`, then let it go on.
+async fn drop_sync_caller_at(stage: Stage) -> (VaultConfig, SourceLifecycle, tempfile::TempDir) {
+    let vault_dir = tempdir().expect("vault tempdir");
+    let config = VaultConfig::new(vault_dir.path());
+    let plain = SourceLifecycle::new(config.clone());
+    let docs = local_source(&plain, "docs").await;
+
+    let (gated, mut gate) = Gate::at(plain.clone(), stage);
+    let caller = tokio::spawn(async move { gated.sync("docs", false).await });
+    gate.reached().await;
+    caller.abort();
+    assert!(caller.await.expect_err("aborted").is_cancelled());
+    gate.open();
+    std::mem::forget(vault_dir); // keep the vault for the caller's assertions
+    (config, plain, docs)
+}
+
+#[tokio::test]
+async fn sync_caller_dropped_after_claim_commits_neither_cancels_nor_leaks() {
+    let (config, lifecycle, _docs) = drop_sync_caller_at(Stage::Claimed).await;
+    assert_eq!(
+        wait_for_status(&config, "docs", "ok").await,
+        "ok",
+        "the Sync runs to the end without its caller"
+    );
+    let mut rows = claim_rows(&config);
+    for _ in 0..100 {
+        if rows == 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        rows = claim_rows(&config);
+    }
+    assert_eq!(rows, 0, "the claim is released");
+    assert!(
+        matches!(
+            lifecycle.sync("docs", false).await.expect("sync again"),
+            SyncOutcome::Synced(_)
+        ),
+        "this process can Sync the Source again"
+    );
+}
+
+#[tokio::test]
+async fn sync_caller_dropped_while_loading_still_syncs() {
+    let (config, _lifecycle, _docs) = drop_sync_caller_at(Stage::Loaded).await;
+    assert_eq!(
+        wait_for_status(&config, "docs", "ok").await,
+        "ok",
+        "a Sync whose caller left before the claim still runs"
+    );
+}
+
 #[tokio::test]
 async fn claim_caller_dropped_after_claim_commits_does_not_leak() {
     let vault_dir = tempdir().expect("vault tempdir");
@@ -594,6 +661,7 @@ async fn claim_caller_dropped_after_claim_commits_does_not_leak() {
 
     let (gated, mut gate) = Gate::at(plain.clone(), Stage::Claimed);
     let caller = tokio::spawn(async move { gated.claim("docs").await.map(|c| c.is_some()) });
+    // `claim` takes the claim in one hop; the gate pauses it right after the row commits.
     gate.reached().await;
     caller.abort();
     let _ = caller.await;
