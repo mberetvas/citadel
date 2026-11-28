@@ -128,3 +128,36 @@ impl RunningSync { pub async fn finish(self) -> Result<SyncSummary>; }
 - **The lifecycle logs `web_sync_summary` itself.** That puts web accounting into `src/sources/`; the `on_written` hook keeps it in `web.rs`.
 - **A separate transaction for the 'ok' close.** This regresses crash consistency: pages could commit while the run stays `'running'`.
 - **The `async-trait` crate for the driver seam.** It adds a dependency for one method.
+
+## Review fixes
+
+The independent review ran `/code-review` at medium effort on `116f42c..3843e91`. Red output is in the HumanAudit report.
+
+1. **`finish()` lost the driver's error when it could not open the vault: fixed in 0618cf7.**
+   - The driver's error now wins.
+   - `on_written(false, ..)` always runs. A `WriteReport` guard also reports a panic while writing.
+   - `finish()` retries once on a fresh connection to close the run and release the claim before returning.
+   - Red, then green:
+     - `database_open_failure_after_the_driver_keeps_its_error_and_closes_the_run`: red with the error "unable to open database file", which replaced "crawl broke".
+     - `database_open_failure_before_the_write_reports_it_and_closes_the_run`: red, `written()` was `[]`.
+   - The test probe makes the first open fail (`Stage::Finishing` chmods `vault.db` to 000) and the retry succeed (`Stage::Recording`).
+   - If the retry fails too, nothing can be recorded. The error is logged, and the dropped guard falls back to its background release.
+2. **A failed `remove`, or a failure to open the run, released the claim only in the background: fixed in 0618cf7.**
+   - Both now release on the hop's connection before returning.
+   - `ClaimEnv::on_late_release` counts background releases, so the tests are deterministic.
+   - Red, then green:
+     - `failed_remove_releases_the_claim_before_returning`: late releases were 1.
+     - `failure_to_open_the_run_releases_the_claim`: late releases were 1. It no longer polls.
+3. **Version still 0.4.1: deferred by design.** The bump and the tag happen once, at merge time.
+4. **A claim release during runtime shutdown may not run: pre-existing, documented in 0618cf7.**
+   - `ClaimGuard::drop` now says the row is left like a crashed process's, and that ADR-0001's takeover rules (dead pid, reused pid with another token, 6 h) recover it.
+   - Follow-up: release synchronously when the runtime is shutting down.
+5. **`sync_all` swallowed a NotFound from any stage: fixed in aef90b9.**
+   - Only a NotFound before the claim is skipped.
+   - Red, then green: `sync_all_reports_a_drivers_not_found_instead_of_skipping_the_source` (red: 0 results).
+6. **SPEC said every failed Sync records a run: fixed in the docs commit.** It now says "once its Sync run is open", and that a failure before that releases the claim first.
+7. **No test checked `write_ms` after `on_written`: fixed in the `test(web)` commit.**
+   - `summary_line_after_the_write_carries_ok_and_write_ms` captures the logged line.
+   - It was shown to fail (`write_ms=-`) with the `write_ms` assignment removed.
+
+Still deferred: "`add` returns its first Sync as a value" (see Findings).

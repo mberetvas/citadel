@@ -415,7 +415,7 @@ To eliminate false-positive diffs (such as volatile `created:` / `updated:` / `c
   - `remove` returns the deleted source name and page count; `add`/`sync` returns structured sync summary (`pages_added`, `pages_updated`, `pages_unchanged`, `pages_stale`, `pages_failed`).
   - `sync` without `name` syncs every Source independently and also returns `results`: one entry per Source with `outcome` `synced` (plus `summary`), `already_syncing`, or `error` (plus `error`). A failed Source never stops the others.
   - A Source whose Sync claim is held elsewhere is not synced or removed: `sync`/`remove` return `outcome: "already_syncing"` with `isError: false`.
-  - Every failed Sync, from any entry point, records an error Sync run and sets the Source's `status = 'error'` and `last_error`.
+  - Every failed Sync, from any entry point, records an error Sync run and sets the Source's `status = 'error'` and `last_error` once its Sync run is open. A failure before that (the Source is missing, or the run cannot be opened) records nothing and releases the Sync claim before the error returns.
   - Each Sync records exactly one Sync run. A Sync runs as its own task from claim to release, so a caller that disconnects (MCP HTTP, the UI's `POST /api/sources/{id}/sync`, a timed-out client) neither cancels it nor leaves its Sync claim behind.
 - **Error response (both tools):** `isError: true` with an actionable error message (e.g., `"Write operations are disabled on MCP query tool"`, `"no such column: ..."`, or `"origin must be an http(s) URL or existing directory"`), enabling immediate LLM self-correction.
 
