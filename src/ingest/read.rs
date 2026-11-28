@@ -60,9 +60,7 @@ impl PageStatuses {
                 "active" => out.active = true,
                 "stale" => out.stale = true,
                 "error" => out.error = true,
-                other => return Err(VaultError::Validation(format!(
-                    "invalid page status '{other}'; expected one or more of: active, stale, error"
-                ))),
+                other => return Err(invalid_status(other)),
             }
         }
         Ok(out)
@@ -71,6 +69,12 @@ impl PageStatuses {
     fn is_any(self) -> bool {
         self == Self::ANY
     }
+}
+
+fn invalid_status(status: &str) -> VaultError {
+    VaultError::Validation(format!(
+        "invalid page status '{status}'; expected one or more of: active, stale, error"
+    ))
 }
 
 /// Which Pages a Page list returns.
