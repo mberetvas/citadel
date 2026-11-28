@@ -225,13 +225,14 @@ struct Systemd {
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 impl Systemd {
-    /// Registered with systemd: `enabled`. `is-active` is false for a stopped unit.
+    /// Running under systemd: `active`. Whether this vault's daemon is supervised does not
+    /// depend on it; it is what doctor reports.
     fn loaded() -> bool {
         std::process::Command::new("systemctl")
-            .args(systemd_args("is-enabled"))
+            .args(SYSTEMD_LOADED_QUERY)
             .stderr(std::process::Stdio::null())
             .output()
-            .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).trim() == "enabled")
+            .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).trim() == "active")
     }
 }
 
@@ -248,6 +249,10 @@ impl ServiceManager for Systemd {
         run_service_command("systemctl", &systemd_args("stop"))
     }
 }
+
+/// Asks systemd whether the unit runs: `citadel daemon stop` leaves it enabled but inactive,
+/// as it leaves a launchd job booted out.
+const SYSTEMD_LOADED_QUERY: [&str; 3] = ["--user", "is-active", SYSTEMD_SERVICE_NAME];
 
 /// `systemctl --user <verb> citadel.service`.
 fn systemd_args(verb: &str) -> [&str; 3] {
@@ -646,6 +651,16 @@ mod tests {
         };
         assert!(loaded);
         assert_eq!(file.data_dir.as_deref(), Some(dir.path()));
+    }
+
+    #[test]
+    fn systemd_loaded_means_active() {
+        // `citadel daemon stop` leaves the unit enabled but inactive; doctor must then show
+        // it as not loaded, as it does for a booted-out launchd job.
+        assert_eq!(
+            SYSTEMD_LOADED_QUERY,
+            ["--user", "is-active", "citadel.service"]
+        );
     }
 
     #[test]

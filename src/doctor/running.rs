@@ -58,7 +58,18 @@ pub fn service_checks(state: &ServiceState, cli_data_dir: &Path, cli_exe: &Path)
                     format!("installed and loaded ({})", file.path.display()),
                 ));
             } else {
-                // `citadel daemon stop` unloads the service; `start` loads it again.
+                // `citadel daemon stop` stops this vault's service (launchd: unloads the job;
+                // systemd: the unit goes inactive); `start` starts it again. For another
+                // vault's service, `start` would spawn a detached daemon instead.
+                let this_vault = file
+                    .data_dir
+                    .as_deref()
+                    .is_some_and(|dir| crate::fsutil::same_path(dir, cli_data_dir));
+                let hint = if this_vault {
+                    "citadel daemon start"
+                } else {
+                    "citadel daemon install"
+                };
                 checks.push(
                     Check::info(
                         Section::Running,
@@ -68,7 +79,7 @@ pub fn service_checks(state: &ServiceState, cli_data_dir: &Path, cli_exe: &Path)
                             file.path.display()
                         ),
                     )
-                    .with_hint("citadel daemon start"),
+                    .with_hint(hint),
                 );
             }
             if let Some(reason) = &file.unreadable {
@@ -340,6 +351,22 @@ mod tests {
         assert_eq!(checks[0].status, CheckStatus::Info);
         assert!(checks[0].detail.contains("not loaded"));
         assert_eq!(checks[0].hint.as_deref(), Some("citadel daemon start"));
+    }
+
+    #[test]
+    fn service_not_loaded_for_another_vault_hints_install() {
+        // `citadel daemon start` would spawn a detached daemon for this vault and never load
+        // the other vault's service.
+        let checks = service_checks(
+            &installed("/bin/c", "/other", false),
+            Path::new("/data"),
+            Path::new("/bin/c"),
+        );
+        let row = checks
+            .iter()
+            .find(|c| c.name == "service")
+            .expect("service row");
+        assert_eq!(row.hint.as_deref(), Some("citadel daemon install"));
     }
 
     #[test]
