@@ -125,3 +125,9 @@ Source: the second `/code-review medium --fix` of `116f42c..433193b`.
 | 4 | An absolute pattern with a non-ASCII (punycode) or IPv6 host never matches | **Deferred: follow-up** | It needs absolute patterns to parse their authority with `Url::parse` and glob only the path, which changes what `*` means in a host. Rare. |
 | 5 | No version bump | **Deferred** by instruction | The bump and the `vX.Y.Z` tag happen once, at merge. |
 | 6 | A prefix pattern with `#` (`guide#legacy`) is encoded to `%23` and no longer matches the fragment URL | **Deferred: needs a decision** | Rejecting `#` (as with query patterns) or documenting it both change behavior. Fragments name the same page, so the impact is small. |
+
+## User decisions
+
+| Decision | Change | Evidence |
+|---|---|---|
+| Second review finding 6 (`#` in patterns): **reject** | `UrlPattern::parse` rejects any pattern that contains `#`, next to the query-pattern rule, with the message "pattern '…' contains '#'; patterns match only the URL path (fragments are ignored), so remove the '#...' part". Add and update through `SourceLifecycle` reject it too. A stored web Source with such a pattern fails its next Sync with a validation error until the pattern is edited, the same as a query pattern. SPEC §4.1 is updated. | Red then green: `scope_tests::patterns_glob_rejects_are_validation_errors` (rows `docs/page#intro`, `https://ex.com/docs#*`, `docs/*#`, `#top`) and `sources::tests::web_source_patterns_are_validated_on_add_and_update` (`api/page#intro` on add, `api/*#top` on update). |
