@@ -59,7 +59,7 @@ citadel daemon install
 Every [GitHub Release](https://github.com/MaximeBeretvas/citadel/releases) ships a `citadel` binary built with the default features (including `chrome`) for macOS (Apple Silicon `aarch64-apple-darwin`, Intel `x86_64-apple-darwin`) and Linux (`x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`; glibc 2.35+), plus a `checksums.sha256` manifest. No Rust toolchain needed:
 
 ```bash
-V=v0.4.1                  # release tag
+V=v0.5.0                  # release tag
 T=aarch64-apple-darwin    # your target, from the list above
 curl -LO https://github.com/MaximeBeretvas/citadel/releases/download/$V/citadel-$V-$T.tar.gz
 curl -LO https://github.com/MaximeBeretvas/citadel/releases/download/$V/checksums.sha256
