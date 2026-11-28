@@ -592,6 +592,8 @@ async fn watcher_sync(
 fn load_local_sources(config: &VaultConfig) -> Result<Vec<SourceRecord>> {
     let mut sources = ingest::all_sources(config)?;
     sources.retain(|source| source.kind == SourceKind::Local);
+    // Watch in id order, as before the read module (all_sources is by name).
+    sources.sort_by_key(|source| source.id);
     Ok(sources)
 }
 
