@@ -260,11 +260,15 @@ impl Drop for WriteReport {
 /// built here, next to the row it guards, so no await separates them.
 fn begin(lifecycle: &SourceLifecycle, target: Target) -> Result<Option<Begun>> {
     let db_path = lifecycle.config.db_path();
+    // A missing vault has no Sources: report that instead of creating an empty vault.
+    if !db_path.exists() {
+        let name = match &target {
+            Target::Name(name) | Target::Record { name, .. } => name,
+        };
+        return Err(VaultError::NotFound(format!("source '{name}' not found")));
+    }
     match target {
         Target::Name(name) => {
-            if !db_path.exists() {
-                return Err(VaultError::NotFound(format!("source '{name}' not found")));
-            }
             let conn = open_rw_db(&db_path)?;
             let id = load_source_by_name(&conn, &name)?.id;
             begin_on(lifecycle, &conn, id)

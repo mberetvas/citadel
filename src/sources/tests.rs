@@ -904,6 +904,31 @@ async fn missing_source_is_not_found_and_records_nothing() {
 }
 
 #[tokio::test]
+async fn sync_of_a_loaded_source_after_the_vault_is_gone_does_not_create_it() {
+    let (_vault, config, lifecycle) = vault_with_docs().await;
+    let source = {
+        let conn = open_rw_db(&config.db_path()).expect("open vault");
+        load_source_by_name(&conn, "docs").expect("docs")
+    };
+    let db = config.db_path();
+    for suffix in ["", "-wal", "-shm"] {
+        let path = std::path::PathBuf::from(format!("{}{suffix}", db.display()));
+        if path.exists() {
+            std::fs::remove_file(&path).expect("remove vault file");
+        }
+    }
+
+    let err = lifecycle
+        .with_driver(FakeDriver::one_page())
+        .start_sync_record(source, false)
+        .finish()
+        .await
+        .expect_err("the vault is gone");
+    assert!(matches!(err, VaultError::NotFound(_)), "{err:?}");
+    assert!(!db.exists(), "the Sync recreated an empty vault");
+}
+
+#[tokio::test]
 async fn second_start_while_a_sync_runs_is_already_syncing() {
     let (_vault, config, lifecycle) = vault_with_docs().await;
     let (fake, mut gate) = FakeDriver::one_page().gated();

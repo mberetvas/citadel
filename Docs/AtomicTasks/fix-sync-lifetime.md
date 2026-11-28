@@ -161,3 +161,20 @@ The independent review ran `/code-review` at medium effort on `116f42c..3843e91`
    - It was shown to fail (`write_ms=-`) with the `write_ms` assignment removed.
 
 Still deferred: "`add` returns its first Sync as a value" (see Findings).
+
+## Second review
+
+The second review ran `/code-review` at medium effort with `--fix` on `116f42c..bd68aa4`. It found no blocking bug.
+
+1. **`begin` created an empty vault for a loaded Source when `vault.db` was gone (nit, `src/sources/sync.rs`): applied.**
+   - Only the `Target::Name` branch checked that the file exists. The `Target::Record` branch (`sync_all`, the scheduler, `add`) called `open_rw_db`, which creates a fresh database.
+   - `begin` now checks before the match, for both targets, and returns `NotFound`.
+   - Red, then green: `sync_of_a_loaded_source_after_the_vault_is_gone_does_not_create_it` (red: "the Sync recreated an empty vault").
+2. **A failed claim release leaves the Source `AlreadySyncing` until the process restarts (pre-existing, `src/sources/claim.rs` `ClaimGuard::release`): deferred.**
+   - `try_acquire` never takes back a row with this process's pid and token, and `finish`/`remove` only log a failed release.
+   - Follow-up: let this process take back a claim no in-memory guard holds, or retry the release. This needs an ADR-0001 decision.
+3. **A failed `run.fail` loses the Sync's real error (nit, `src/sources/sync.rs` `finish`): deferred.**
+   - The release that follows closes the run with the generic "interrupted" message. The real error only reaches the log. This is safe; a retry on a fresh connection is optional.
+4. **No `web_sync_summary` line when the final hop never runs (nit, runtime shutdown after a crawl): deferred.**
+   - `SyncPages::on_written` has no Drop fallback. Adding one needs `write_pages` to stop destructuring `SyncPages`.
+5. **Version still 0.4.1 (nit): deferred by design.** The bump and the tag happen once, at merge time.
