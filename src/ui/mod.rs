@@ -610,8 +610,28 @@ mod tests {
         (status, read_json_body(resp).await)
     }
 
+    async fn get_pages(app: &Router, uri: &str) -> (StatusCode, bool, Value) {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(uri)
+                    .body(Body::empty())
+                    .expect("build GET request"),
+            )
+            .await
+            .expect("GET response");
+        let status = resp.status();
+        let truncated = resp
+            .headers()
+            .get("x-citadel-truncated")
+            .is_some_and(|v| v == "true");
+        (status, truncated, read_json_body(resp).await)
+    }
+
     #[tokio::test]
-    async fn all_sources_page_list_has_http_status_and_no_cap() {
+    async fn all_sources_page_list_has_http_status_and_a_marked_cap() {
         let vault_dir = tempdir().expect("vault tempdir");
         let config = VaultConfig::new(vault_dir.path());
         let conn = open_rw_db(&config.db_path()).expect("init db");
@@ -636,9 +656,11 @@ mod tests {
         drop(conn);
         let app = build_router(config);
 
-        // All sources: every Page, with http_status, beyond the old 100-row cap.
-        let (status, pages) = get_json(&app, "/api/pages").await;
+        // All sources: every Page, with http_status, beyond the old 100-row cap; under
+        // the default cap, so not marked truncated.
+        let (status, truncated, pages) = get_pages(&app, "/api/pages").await;
         assert_eq!(status, StatusCode::OK);
+        assert!(!truncated);
         let pages = pages.as_array().expect("pages array");
         assert_eq!(pages.len(), 121);
         let gone = pages
@@ -654,7 +676,21 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(pages.as_array().expect("array").len(), 1);
 
-        // One Source, by query parameter or by path: the same read.
+        // A smaller limit cuts the list and marks it truncated; a list that exactly
+        // fits is not marked.
+        let (_, truncated, pages) = get_pages(&app, "/api/pages?limit=50").await;
+        assert_eq!(pages.as_array().expect("array").len(), 50);
+        assert!(truncated);
+        let (_, truncated, _) = get_pages(&app, "/api/pages?limit=121").await;
+        assert!(!truncated);
+        for uri in ["/api/pages?limit=0", "/api/pages?limit=10001"] {
+            let (status, _) = get_json(&app, uri).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+        }
+
+        // One Source, by query parameter (surrounding blanks ignored) or by path.
+        let (status, _) = get_json(&app, "/api/pages?source=beta%20").await;
+        assert_eq!(status, StatusCode::OK);
         let (_, by_param) = get_json(&app, "/api/pages?source=beta&status=active").await;
         let (_, by_path) = get_json(&app, "/api/sources/2/pages?status=active").await;
         assert_eq!(by_param.as_array().expect("array").len(), 120);
@@ -948,6 +984,11 @@ mod tests {
 
         let app_js = get_asset_text(&app, "/app.js").await;
         assert!(app_js.contains("/api/pages"), "app.js must use /api/pages");
+        // A cut list is shown as such, and a superseded Browser search cannot
+        // overwrite a newer one.
+        for expected in ["X-Citadel-Truncated", "browserSearchSeq"] {
+            assert!(app_js.contains(expected), "app.js missing `{expected}`");
+        }
         // The Browser and the Health list no longer build SQL in the client, and the
         // banner's Error rule is the server's (`pages.status`), not its own.
         for forbidden in [

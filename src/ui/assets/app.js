@@ -38,6 +38,7 @@
     selectedChangePageId: null,
     sqlHasRun: false,
     addSourceKind: "web",
+    browserSearchSeq: 0,
   };
 
   function el(id) {
@@ -116,7 +117,21 @@
         `Request failed (${resp.status} ${resp.statusText})`;
       throw new Error(msg);
     }
-    return payload;
+    return options.withHeaders ? { payload, headers: resp.headers } : payload;
+  }
+
+  // GET a Page list. The server cuts a list at its limit (default 1000) and says so
+  // in a header, so the count can read "1000+" instead of looking complete.
+  async function fetchPageList(path) {
+    const { payload, headers } = await apiRequest(path, { withHeaders: true });
+    return {
+      pages: Array.isArray(payload) ? payload : [],
+      truncated: headers.get("X-Citadel-Truncated") === "true",
+    };
+  }
+
+  function formatPageCount(list) {
+    return list.truncated ? `${list.pages.length}+` : String(list.pages.length);
   }
 
   // Theme management (supports automatic prefers-color-scheme + persisted override)
@@ -775,6 +790,8 @@
     const q = el("browser-search-input").value.trim();
     const listEl = el("browser-page-list");
     const countEl = el("browser-page-count");
+    // Only the latest search may render: a slower, superseded response is dropped.
+    const seq = ++state.browserSearchSeq;
 
     try {
       const params = new URLSearchParams();
@@ -782,10 +799,11 @@
       if (status) params.set("status", status);
       if (q) params.set("q", q);
       const qs = params.toString();
-      const pages = await apiRequest(`/api/pages${qs ? `?${qs}` : ""}`);
+      const list = await fetchPageList(`/api/pages${qs ? `?${qs}` : ""}`);
+      if (seq !== state.browserSearchSeq) return;
 
-      state.browserPages = Array.isArray(pages) ? pages : [];
-      countEl.textContent = String(state.browserPages.length);
+      state.browserPages = list.pages;
+      countEl.textContent = formatPageCount(list);
       renderBrowserPageList();
 
       if (state.browserPages.length) {
@@ -798,6 +816,7 @@
           '<div class="empty-state">No pages matched the current filter.</div>';
       }
     } catch (err) {
+      if (seq !== state.browserSearchSeq) return;
       listEl.innerHTML = `<div class="empty-state">Failed to load pages: ${escapeHtml(err.message)}</div>`;
     }
   }
@@ -1024,11 +1043,11 @@
     const tbody = el("health-tbody");
     const countEl = el("health-count");
     try {
-      const pages = await apiRequest("/api/pages?status=stale,error");
-      const rows = (Array.isArray(pages) ? pages : []).sort((a, b) =>
+      const list = await fetchPageList("/api/pages?status=stale,error");
+      const rows = list.pages.sort((a, b) =>
         String(b.last_checked_at || "").localeCompare(String(a.last_checked_at || ""))
       );
-      countEl.textContent = String(rows.length);
+      countEl.textContent = formatPageCount(list);
 
       if (!rows.length) {
         tbody.innerHTML =

@@ -89,6 +89,8 @@ pub struct PageQuery {
     pub statuses: PageStatuses,
     /// Search term; blank means no search.
     pub search: Option<String>,
+    /// At most this many Pages, in list order; every match when `None`.
+    pub limit: Option<u32>,
 }
 
 const SOURCE_COLUMNS: &str = "id, name, kind, origin, tags, include_patterns, exclude_patterns,
@@ -130,7 +132,13 @@ fn query_pages(conn: &Connection, query: &PageQuery) -> Result<Vec<PageListItem>
         binds.push(phrases);
         binds.push(pattern);
     }
-    let mut stmt = conn.prepare(&page_list_sql(search.is_some()))?;
+    let mut sql = page_list_sql(search.is_some());
+    if let Some(limit) = &query.limit {
+        // `?` takes the next number after the highest bound so far.
+        sql.push_str(" LIMIT ?");
+        binds.push(limit);
+    }
+    let mut stmt = conn.prepare(&sql)?;
     let rows = stmt
         .query_map(params_from_iter(binds), map_page_list_item)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -271,6 +279,7 @@ fn select_source_detail(conn: &Connection, name: &str) -> Result<SourceDetail> {
             source_id: Some(source.id),
             statuses: PageStatuses::STALE_OR_ERROR,
             search: None,
+            limit: None,
         },
     )?;
 
@@ -556,7 +565,7 @@ mod tests {
     }
 
     #[test]
-    fn page_list_has_no_row_cap() {
+    fn page_list_has_no_row_cap_without_a_limit() {
         let (_dir, config) = seeded_vault();
         let conn = open_rw_db(&config.db_path()).expect("open_rw_db");
         for i in 0..150 {
@@ -569,6 +578,29 @@ mod tests {
         }
         let pages = list_pages(&config, &PageQuery::default()).expect("list all");
         assert_eq!(pages.len(), 154);
+    }
+
+    #[test]
+    fn limits_a_page_list_in_list_order() {
+        let (_dir, config) = seeded_vault();
+        for query in [
+            PageQuery::default(),
+            PageQuery {
+                search: Some("vault".into()),
+                ..PageQuery::default()
+            },
+        ] {
+            let all = list_pages(&config, &query).expect("all");
+            let first = list_pages(
+                &config,
+                &PageQuery {
+                    limit: Some(1),
+                    ..query.clone()
+                },
+            )
+            .expect("limited");
+            assert_eq!(uris(&first), uris(&all[..1]), "{query:?}");
+        }
     }
 
     #[test]

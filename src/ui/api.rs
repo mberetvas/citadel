@@ -100,7 +100,18 @@ pub struct ListPagesQuery {
     /// Comma-separated subset of `active,stale,error`.
     pub status: Option<String>,
     pub q: Option<String>,
+    /// At most this many Pages (1..=10000, default 1000).
+    pub limit: Option<u32>,
 }
+
+/// Default and largest `limit` for a Page list.
+const DEFAULT_PAGE_LIMIT: u32 = 1000;
+const MAX_PAGE_LIMIT: u32 = 10_000;
+
+/// Header set to `true` when a Page list was cut at its `limit`.
+const TRUNCATED_HEADER: &str = "x-citadel-truncated";
+
+type PageListResponse = ([(&'static str, &'static str); 1], Json<Vec<PageListItem>>);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PageSectionItem {
@@ -287,8 +298,13 @@ pub async fn sync_source(
 pub async fn list_pages(
     State(state): State<UiState>,
     Query(query): Query<ListPagesQuery>,
-) -> ApiResult<Json<Vec<PageListItem>>> {
-    let source = query.source.clone().filter(|s| !s.trim().is_empty());
+) -> ApiResult<PageListResponse> {
+    let source = query
+        .source
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
     read_pages(state, source, query).await
 }
 
@@ -297,7 +313,7 @@ pub async fn list_source_pages(
     State(state): State<UiState>,
     Path(id_or_slug): Path<String>,
     Query(query): Query<ListPagesQuery>,
-) -> ApiResult<Json<Vec<PageListItem>>> {
+) -> ApiResult<PageListResponse> {
     read_pages(state, Some(id_or_slug), query).await
 }
 
@@ -305,8 +321,15 @@ async fn read_pages(
     state: UiState,
     source: Option<String>,
     query: ListPagesQuery,
-) -> ApiResult<Json<Vec<PageListItem>>> {
+) -> ApiResult<PageListResponse> {
     let statuses = PageStatuses::parse(query.status.as_deref().unwrap_or(""))?;
+    let limit = query.limit.unwrap_or(DEFAULT_PAGE_LIMIT);
+    if !(1..=MAX_PAGE_LIMIT).contains(&limit) {
+        return Err(VaultError::Validation(format!(
+            "invalid limit {limit}; expected 1 to {MAX_PAGE_LIMIT}"
+        ))
+        .into());
+    }
     let config = state.config;
     let pages = blocking(move || {
         let source_id = match source {
@@ -319,11 +342,17 @@ async fn read_pages(
                 source_id,
                 statuses,
                 search: query.q,
+                // One extra row tells a cut list from one that exactly fits.
+                limit: Some(limit + 1),
             },
         )
     })
     .await?;
-    Ok(Json(pages))
+    let mut pages = pages;
+    let truncated = pages.len() > limit as usize;
+    pages.truncate(limit as usize);
+    let flag = if truncated { "true" } else { "false" };
+    Ok(([(TRUNCATED_HEADER, flag)], Json(pages)))
 }
 
 /// `GET /api/pages/{id}`
