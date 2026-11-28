@@ -299,3 +299,45 @@ it on the new version.
 - The drain-first stop relies on KeepAlive leaving a gap in which the service stop ends the
   relaunched daemon. The service stop and `wait_until_free` cover it, but a real launchd job
   was not exercised.
+
+### Decision: `citadel daemon stop` waits for the Sync (user, after the review fixes)
+The user chose "drain, then wait until done" for a supervised stop. This replaces the 5 s cap
+of the finding-1 fix:
+1. SIGTERM the daemon. It stops starting Syncs and finishes the ones it runs.
+2. Wait for it to exit with **no time limit**. After 1 s, and then every 10 s, print
+   `Waiting for <Source> to finish its Sync (Ns so far; Ctrl-C to stop waiting)...`. The
+   Source names come from `sync_claims` rows held by the daemon's pid, read through a
+   read-only connection.
+3. Once it has exited, stop this vault's OS service. That also ends a daemon KeepAlive
+   relaunched in the window. A stop therefore stops for good, never kills a Sync, and needs
+   no reinstall. `ExitTimeOut` / `TimeoutStopSec` are not added.
+4. Ctrl-C only stops the wait (`Stopped::StillDraining { pid, supervised }`). Nothing is
+   killed, and the service is left running. The CLI says that the daemon exits after its
+   Sync, that a supervised one is relaunched by its service, and that the user should run
+   `citadel daemon stop` again.
+
+The interface change is that `Supervision::stop` takes an `on_wait` callback. It receives
+`Draining { pid, waited }` about every 100 ms and returns `Wait::Continue` or `Wait::Abort`.
+The CLI owns the printing and the Ctrl-C flag: a thread runs `tokio::signal::ctrl_c` and sets
+an `AtomicBool`.
+
+`citadel update` keeps its 5 s limit (`restart` calls the stop with a limit). It reports a
+daemon still syncing instead of blocking the update, as before.
+
+| Test (red first through the fake) | What it pins |
+|---|---|
+| `supervised_stop_waits_out_a_long_sync_and_stops_for_good` | A Sync that ends after 600 ms, past the rig's old 300 ms cap, ends in `Stopped`, not relaunched, service stopped, nothing killed. KeepAlive relaunches at once, between the exit and the service stop. |
+| `supervised_stop_wins_a_delayed_relaunch` | Same, with a relaunch 100 ms after the exit: the service stop lands first and nothing comes back. |
+| `stop_can_stop_waiting_and_leaves_the_daemon_draining` | Abort (the CLI's Ctrl-C) gives `StillDraining`: the daemon is alive, the service is loaded and nothing is killed. When the Sync ends, the service relaunches the daemon, as the message says. |
+| `stop_reports_its_wait_while_the_daemon_drains` | `on_wait` is called while the daemon drains, with a growing `waited`. |
+| `cli::tests::daemon_stop_names_the_sources_it_waits_for`, `daemon_stop_says_how_to_finish_after_ctrl_c` | The Source lookup from `sync_claims`, the waiting line, and the Ctrl-C message. |
+
+The first two were red on the previous code: "did not exit within 0 seconds". The abort test
+replaces the capped-timeout tests `stop_times_out_while_the_daemon_finishes_a_sync` and
+`supervised_stop_lets_the_daemon_finish_its_sync`. A stop has no timeout any more, so those
+tests would wait forever.
+
+Not verified live: the real Ctrl-C handling, and the waiting line during a real long Sync.
+Both need a running daemon that is syncing, and only the fake exercised them. With the
+handler installed, Ctrl-C does not end `citadel daemon stop`; the second press is handled
+the same way, and the process ends once the stop returns.

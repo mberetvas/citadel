@@ -94,6 +94,27 @@ pub enum Stopped {
         pid: u32,
         by: u32,
     },
+    /// The caller stopped waiting: daemon `pid` got `SIGTERM` and is still finishing its
+    /// Syncs; it exits once they are done. A `supervised` daemon's service was left running
+    /// and relaunches it then.
+    StillDraining {
+        pid: u32,
+        supervised: bool,
+    },
+}
+
+/// A stop waiting for daemon `pid` to finish its in-flight Syncs and exit.
+#[derive(Debug, Clone, Copy)]
+pub struct Draining {
+    pub pid: u32,
+    pub waited: Duration,
+}
+
+/// Whether a stop keeps waiting for a draining daemon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Wait {
+    Continue,
+    Abort,
 }
 
 /// Outcome of [`Supervision::restart`].
@@ -171,16 +192,23 @@ impl Supervision {
         self.start_as(self.supervised())
     }
 
-    /// Stop the daemon; a supervised daemon's service is stopped once the daemon has exited,
-    /// so it stays stopped.
-    pub fn stop(&self) -> Result<Stopped> {
-        self.stop_as(self.supervised())
+    /// Stop the daemon for good: SIGTERM it, wait (with no time limit) for it to finish its
+    /// in-flight Syncs and exit, then stop a supervised daemon's service so `KeepAlive` does
+    /// not relaunch it. `on_wait` is called while the daemon drains, about every 100 ms;
+    /// [`Wait::Abort`] stops waiting and leaves the daemon draining
+    /// ([`Stopped::StillDraining`]).
+    pub fn stop(&self, on_wait: &mut dyn FnMut(&Draining) -> Wait) -> Result<Stopped> {
+        self.stop_as(self.supervised(), None, on_wait)
     }
 
     /// Stop the daemon `old_pid` and start it again on the binary now on disk.
     pub fn restart(&self, old_pid: u32) -> Restart {
         let supervised = self.supervised();
-        let stop_error = self.stop_as(supervised).err();
+        // An update does not wait out a long Sync: past the stop timeout it reports the daemon
+        // as not stopped, and leaves it (and its service) to finish.
+        let stop_error = self
+            .stop_as(supervised, Some(self.stop_timeout), &mut |_| Wait::Continue)
+            .err();
         // A service manager this vault does not recognise as its own (a plist that names no
         // vault, a moved vault) may still relaunch the daemon: give it a moment before a
         // spawned daemon would fight it for the lock. A supervised daemon's service is
@@ -241,9 +269,14 @@ impl Supervision {
     /// Drain first: SIGTERM the daemon and wait for it to finish its in-flight Syncs and
     /// exit; only then stop the service, so `KeepAlive` does not relaunch it. Stopping the
     /// service first would have launchd (`ExitTimeOut`) or systemd (`TimeoutStopSec`)
-    /// SIGKILL a daemon that is still finishing a Sync. A daemon still running when the wait
-    /// runs out is left alone, service and all.
-    fn stop_as(&self, supervised: bool) -> Result<Stopped> {
+    /// SIGKILL a daemon that is still finishing a Sync. A daemon still running when `limit`
+    /// runs out, or when `on_wait` aborts, is left alone, service and all.
+    fn stop_as(
+        &self,
+        supervised: bool,
+        limit: Option<Duration>,
+        on_wait: &mut dyn FnMut(&Draining) -> Wait,
+    ) -> Result<Stopped> {
         let pid = match self.settled_status()? {
             DaemonStatus::Stopped => {
                 self.stop_service(supervised);
@@ -267,10 +300,11 @@ impl Supervision {
                 return Err(err);
             }
         }
-        let relaunched = match self.wait_for_exit(pid)? {
-            Some(Exit::Exited) => None,
-            Some(Exit::Relaunched(by)) => Some(by),
-            None => {
+        let relaunched = match self.wait_for_exit(pid, limit, on_wait)? {
+            Exit::Exited => None,
+            Exit::Relaunched(by) => Some(by),
+            Exit::Aborted => return Ok(Stopped::StillDraining { pid, supervised }),
+            Exit::TimedOut => {
                 let next = if supervised {
                     " Its OS service relaunches it when it exits; run `citadel daemon stop` \
                      again then."
@@ -321,20 +355,31 @@ impl Supervision {
         }
     }
 
-    /// Wait up to the stop timeout for daemon `pid` to release the lock. `None`: it still
-    /// holds it.
-    fn wait_for_exit(&self, pid: u32) -> Result<Option<Exit>> {
-        let deadline = Instant::now() + self.stop_timeout;
+    /// Wait for daemon `pid` to release the lock: for ever, or up to `limit`.
+    fn wait_for_exit(
+        &self,
+        pid: u32,
+        limit: Option<Duration>,
+        on_wait: &mut dyn FnMut(&Draining) -> Wait,
+    ) -> Result<Exit> {
+        let started = Instant::now();
         loop {
             match daemon_status(&self.config)? {
-                DaemonStatus::Stopped | DaemonStatus::Stale => return Ok(Some(Exit::Exited)),
+                DaemonStatus::Stopped | DaemonStatus::Stale => return Ok(Exit::Exited),
                 // 0: a daemon took the lock but has not written its pid yet.
                 DaemonStatus::Running(by) if by != pid && by != 0 => {
-                    return Ok(Some(Exit::Relaunched(by)))
+                    return Ok(Exit::Relaunched(by))
                 }
-                DaemonStatus::Running(_) if Instant::now() >= deadline => return Ok(None),
-                DaemonStatus::Running(_) => std::thread::sleep(POLL),
+                DaemonStatus::Running(_) => {}
             }
+            let waited = started.elapsed();
+            if limit.is_some_and(|limit| waited >= limit) {
+                return Ok(Exit::TimedOut);
+            }
+            if let Wait::Abort = on_wait(&Draining { pid, waited }) {
+                return Ok(Exit::Aborted);
+            }
+            std::thread::sleep(POLL);
         }
     }
 
@@ -364,11 +409,15 @@ impl Supervision {
     }
 }
 
-/// How a daemon left the lock.
+/// How waiting for a daemon to leave the lock ended.
 enum Exit {
     Exited,
     /// Another daemon took the lock straight away.
     Relaunched(u32),
+    /// It still holds the lock after the time limit.
+    TimedOut,
+    /// The caller stopped waiting.
+    Aborted,
 }
 
 /// Real processes: `kill -TERM`, and a detached `citadel daemon start --foreground`.
@@ -438,6 +487,8 @@ mod tests {
         by_service: bool,
         /// Finishing a Sync: it does not exit on `SIGTERM` (yet).
         finishing_sync: bool,
+        /// Got `SIGTERM` while finishing a Sync: it exits once the Sync is done.
+        sigterm_pending: bool,
         _lock: File,
     }
 
@@ -503,6 +554,7 @@ mod tests {
                 binary: self.binary,
                 by_service,
                 finishing_sync: false,
+                sigterm_pending: false,
                 _lock: file,
             });
             pid
@@ -535,6 +587,19 @@ mod tests {
     impl Fake {
         fn world(&self) -> MutexGuard<'_, World> {
             self.0.lock().expect("world lock")
+        }
+
+        /// The running daemon's Sync ends; after a `SIGTERM` it then exits (and a loaded
+        /// `KeepAlive` job relaunches it).
+        fn finish_sync(&self) {
+            let mut w = self.world();
+            let Some(daemon) = w.daemon.as_mut() else {
+                return;
+            };
+            daemon.finishing_sync = false;
+            if daemon.sigterm_pending {
+                self.exit(w);
+            }
         }
 
         /// The daemon exits; a delayed `KeepAlive` relaunch happens on another thread.
@@ -626,9 +691,14 @@ mod tests {
             let Some(daemon) = w.daemon.as_ref().filter(|d| d.pid == pid) else {
                 return Err(VaultError::Other(format!("kill: {pid}: No such process")));
             };
-            if !daemon.finishing_sync {
-                self.exit(w);
+            if daemon.finishing_sync {
+                let mut w = w;
+                if let Some(d) = w.daemon.as_mut() {
+                    d.sigterm_pending = true;
+                }
+                return Ok(());
             }
+            self.exit(w);
             Ok(())
         }
 
@@ -842,7 +912,9 @@ mod tests {
         let rig = Rig::new().with_this_vaults_service();
         let pid = rig.running().expect("running");
         assert_eq!(
-            rig.supervision().stop().expect("stop"),
+            rig.supervision()
+                .stop(&mut |_| Wait::Continue)
+                .expect("stop"),
             Stopped::Stopped(pid)
         );
         assert_eq!(rig.running(), None, "the service did not relaunch it");
@@ -859,7 +931,10 @@ mod tests {
             loaded_binary: 1,
         });
         let pid = rig.world().launch(true);
-        let stopped = rig.supervision().stop().expect("stop");
+        let stopped = rig
+            .supervision()
+            .stop(&mut |_| Wait::Continue)
+            .expect("stop");
         let by = rig.running().expect("relaunched");
         assert_ne!(by, pid);
         assert_eq!(stopped, Stopped::Relaunched { pid, by });
@@ -870,34 +945,112 @@ mod tests {
         let rig = Rig::new().with_this_vaults_service();
         let pid = rig.running().expect("running");
         rig.world().stop_fails = true;
-        let stopped = rig.supervision().stop().expect("stop");
+        let stopped = rig
+            .supervision()
+            .stop(&mut |_| Wait::Continue)
+            .expect("stop");
         let by = rig.running().expect("the loaded service relaunched it");
         assert_eq!(stopped, Stopped::Relaunched { pid, by });
     }
 
     #[test]
-    fn stop_times_out_while_the_daemon_finishes_a_sync() {
-        let rig = Rig::new();
-        rig.world().launch(false);
-        rig.daemon_syncing();
-        let err = rig.supervision().stop().expect_err("still running");
-        assert!(err.to_string().contains("did not exit"), "{err}");
-    }
-
-    #[test]
-    fn supervised_stop_lets_the_daemon_finish_its_sync() {
-        // Stopping the service first would have launchd (`ExitTimeOut`) or systemd
-        // (`TimeoutStopSec`) SIGKILL the daemon mid-Sync, losing the crawl.
+    fn stop_can_stop_waiting_and_leaves_the_daemon_draining() {
+        // Ctrl-C while a supervised daemon finishes a long Sync: nothing is killed, the
+        // service is left running, and the stop says so.
         let rig = Rig::new().with_this_vaults_service();
         let pid = rig.running().expect("running");
         rig.daemon_syncing();
-        let err = rig
+        let mut calls = 0;
+        let stopped = rig
             .supervision()
-            .stop()
-            .expect_err("still finishing its Sync");
-        assert!(err.to_string().contains("did not exit"), "{err}");
-        assert!(!rig.world().killed_mid_sync, "the Sync was cut off");
+            .stop(&mut |draining| {
+                assert_eq!(draining.pid, pid);
+                calls += 1;
+                if calls == 3 {
+                    Wait::Abort
+                } else {
+                    Wait::Continue
+                }
+            })
+            .expect("stop");
+        assert_eq!(
+            stopped,
+            Stopped::StillDraining {
+                pid,
+                supervised: true
+            }
+        );
         assert_eq!(rig.running(), Some(pid), "the daemon finishes its Sync");
+        {
+            let w = rig.world();
+            assert!(!w.killed_mid_sync, "the Sync was cut off");
+            assert!(
+                w.service.as_ref().expect("service").loaded,
+                "service left running"
+            );
+        }
+        // Its Sync ends: it exits, and its service relaunches it, as the stop said.
+        rig.fake.finish_sync();
+        assert!(rig.running().is_some_and(|by| by != pid));
+    }
+
+    #[test]
+    fn stop_reports_its_wait_while_the_daemon_drains() {
+        let rig = Rig::new();
+        rig.world().launch(false);
+        rig.daemon_syncing();
+        let fake = rig.fake.clone();
+        let mut waits = Vec::new();
+        let stopped = rig
+            .supervision()
+            .stop(&mut |draining| {
+                waits.push(draining.waited);
+                if waits.len() == 5 {
+                    fake.finish_sync();
+                }
+                Wait::Continue
+            })
+            .expect("stop");
+        assert!(matches!(stopped, Stopped::Stopped(_)), "{stopped:?}");
+        assert_eq!(waits.len(), 5);
+        assert!(waits.windows(2).all(|w| w[0] <= w[1]), "{waits:?}");
+    }
+
+    /// Stop a supervised daemon whose Sync ends after `sync_left`, well past the old 5 s cap
+    /// (300 ms in the rig); the service relaunches it after `relaunch_delay`.
+    fn stop_through_a_long_sync(relaunch_delay: Duration) {
+        let rig = Rig::new().with_this_vaults_service();
+        rig.world().relaunch_delay = relaunch_delay;
+        let pid = rig.running().expect("running");
+        rig.daemon_syncing();
+        let fake = rig.fake.clone();
+        let sync = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(600));
+            fake.finish_sync();
+        });
+        let stopped = rig.supervision().stop(&mut |_| Wait::Continue);
+        sync.join().expect("sync thread");
+        assert_eq!(stopped.expect("stopped"), Stopped::Stopped(pid));
+        // Past any delayed relaunch: nothing brings it back.
+        std::thread::sleep(relaunch_delay + Duration::from_millis(200));
+        assert_eq!(rig.running(), None, "stopped for good");
+        let w = rig.world();
+        assert!(
+            !w.service.as_ref().expect("service").loaded,
+            "service stopped"
+        );
+        assert!(!w.killed_mid_sync, "the Sync was cut off");
+    }
+
+    #[test]
+    fn supervised_stop_waits_out_a_long_sync_and_stops_for_good() {
+        // KeepAlive relaunches at once, between the exit and the service stop.
+        stop_through_a_long_sync(Duration::ZERO);
+    }
+
+    #[test]
+    fn supervised_stop_wins_a_delayed_relaunch() {
+        stop_through_a_long_sync(Duration::from_millis(100));
     }
 
     #[test]
@@ -907,7 +1060,9 @@ mod tests {
         let rig = Rig::new().with_this_vaults_service();
         let pid = rig.running().expect("running");
         assert_eq!(
-            rig.supervision().stop().expect("stop"),
+            rig.supervision()
+                .stop(&mut |_| Wait::Continue)
+                .expect("stop"),
             Stopped::Stopped(pid)
         );
         assert_eq!(rig.running(), None);
@@ -930,7 +1085,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(150));
             fs::write(pid_path, format!("{pid}\n")).expect("write pid");
         });
-        let stopped = rig.supervision().stop();
+        let stopped = rig.supervision().stop(&mut |_| Wait::Continue);
         writer.join().expect("writer");
         assert_eq!(stopped.expect("stop"), Stopped::Stopped(pid));
     }
@@ -939,7 +1094,12 @@ mod tests {
     fn stop_clears_a_stale_pid_file() {
         let rig = Rig::new();
         fs::write(rig.config.pid_path(), "7\n").expect("stale pid");
-        assert_eq!(rig.supervision().stop().expect("stop"), Stopped::NotRunning);
+        assert_eq!(
+            rig.supervision()
+                .stop(&mut |_| Wait::Continue)
+                .expect("stop"),
+            Stopped::NotRunning
+        );
         assert!(!rig.config.pid_path().exists());
     }
 
@@ -1086,7 +1246,7 @@ mod tests {
                 exe: PathBuf::from("citadel"),
             }),
         );
-        let stopped = supervision.stop();
+        let stopped = supervision.stop(&mut |_| Wait::Continue);
         relauncher.join().expect("relauncher");
         assert_eq!(
             stopped.expect("the old daemon stopped"),
